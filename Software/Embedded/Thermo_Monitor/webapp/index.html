@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reflow Oven Control</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f4f3ef; --surface-1: #fcfcfb; --surface-2: #ffffff;
+    --text-primary: #0b0b0b; --text-secondary: #52514e; --text-muted: #898781;
+    --border: rgba(11,11,11,.12); --grid: #e1e0d9; --axis: #c3c2b7;
+    --series-temp: #2a78d6; --series-sp: #898781; --series-duty: #eb6834;
+    --series-p: #1baf7a; --series-i: #eda100;
+    --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
+    --radius: 8px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-0: #121211; --surface-1: #1a1a19; --surface-2: #211f1e;
+      --text-primary: #f0efec; --text-secondary: #c3c2b7; --text-muted: #898781;
+      --border: rgba(255,255,255,.14); --grid: #2c2c2a; --axis: #383835;
+      --series-temp: #3987e5; --series-duty: #d95926;
+      --series-p: #199e70; --series-i: #c98500;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--surface-0); color: var(--text-primary);
+    font: 400 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; font-weight: 500; margin: 0 0 2px; }
+  .sub { color: var(--text-secondary); font-size: 13px; margin: 0 0 20px; }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 18px; margin-bottom: 16px;
+  }
+  .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; }
+  .tile { background: var(--surface-2); border-radius: var(--radius); padding: 12px 14px; }
+  .tile .k { font-size: 12px; color: var(--text-muted); }
+  .tile .v { font-size: 27px; font-weight: 500; font-variant-numeric: tabular-lining-nums; }
+  .tile .u { font-size: 15px; color: var(--text-secondary); }
+  label { display: block; font-size: 12px; color: var(--text-muted); margin-bottom: 5px; }
+  input[type=number] {
+    width: 110px; height: 38px; padding: 0 10px; font: inherit;
+    background: var(--surface-2); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  input[type=range] { width: 200px; accent-color: var(--series-temp); }
+  button {
+    height: 38px; padding: 0 16px; font: inherit; cursor: pointer;
+    background: var(--surface-2); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  button:hover { border-color: var(--text-muted); }
+  button.primary { background: var(--series-temp); border-color: var(--series-temp); color: #fff; }
+  button.stop { background: var(--crit); border-color: var(--crit); color: #fff; font-weight: 500; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 13px; padding: 5px 11px; border-radius: 999px;
+    background: var(--surface-2); border: 1px solid var(--border);
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--text-muted); }
+  .banner {
+    display: none; padding: 10px 14px; border-radius: var(--radius);
+    font-size: 14px; margin-bottom: 14px;
+    background: rgba(208,59,59,.13); border: 1px solid var(--crit); color: var(--text-primary);
+  }
+  .chartbox { position: relative; width: 100%; height: 280px; }
+  .chartbox.short { height: 150px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 15px; font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+  .legend i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; vertical-align: -1px; margin-right: 5px; }
+  .hint { font-size: 12px; color: var(--text-muted); margin-top: 10px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--text-muted); font-weight: 400; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Reflow oven control</h1>
+  <p class="sub">STM32F103 · MAX6675 thermocouple · PI loop runs on the MCU</p>
+
+  <div class="banner" id="banner"></div>
+
+  <div class="card">
+    <div class="tiles">
+      <div class="tile"><div class="k">temperature</div>
+        <div class="v"><span id="t-temp">—</span><span class="u"> °C</span></div></div>
+      <div class="tile"><div class="k">setpoint</div>
+        <div class="v"><span id="t-sp">—</span><span class="u"> °C</span></div></div>
+      <div class="tile"><div class="k">duty</div>
+        <div class="v"><span id="t-duty">—</span><span class="u"> %</span></div></div>
+      <div class="tile"><div class="k">error</div>
+        <div class="v"><span id="t-err">—</span><span class="u"> °C</span></div></div>
+      <div class="tile"><div class="k">P / I contribution</div>
+        <div class="v" style="font-size:20px"><span id="t-pi">—</span><span class="u"> %</span></div></div>
+    </div>
+    <div style="margin-top:14px"><span class="pill"><span class="dot" id="dot"></span><span id="state">connecting…</span></span></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="sp">setpoint (°C)</label>
+        <input type="number" id="sp" min="0" max="100" step="0.5" value="30">
+      </div>
+      <div>
+        <label for="spr">&nbsp;</label>
+        <input type="range" id="spr" min="20" max="80" step="0.5" value="30">
+      </div>
+      <div>
+        <label for="kp">Kp (%/°C)</label>
+        <input type="number" id="kp" min="0" max="200" step="0.01" value="0.2">
+      </div>
+      <div>
+        <label for="ki">Ki (%/°C/s)</label>
+        <input type="number" id="ki" min="0" max="50" step="0.001" value="0.002">
+      </div>
+      <button class="primary" id="apply">Apply</button>
+      <button id="start">Start heating</button>
+      <button class="stop" id="stop">STOP</button>
+    </div>
+    <p class="hint">Closing this tab stops the heater: the board only keeps heating while it receives a heartbeat relayed from this page, and shuts the output off within a few seconds of losing it. Over-temperature above 120 °C latches off until reset.</p>
+  </div>
+
+  <div class="card">
+    <h2 class="sr-only">Temperature and setpoint over time</h2>
+    <div class="legend">
+      <span><i style="background:var(--series-temp)"></i>temperature</span>
+      <span><i style="background:var(--series-sp)"></i>setpoint</span>
+    </div>
+    <div class="chartbox"><canvas id="chartT" role="img" aria-label="Line chart of measured temperature and commanded setpoint over time">Live temperature and setpoint.</canvas></div>
+    <div class="legend" style="margin-top:14px">
+      <span><i style="background:var(--series-duty)"></i>duty cycle</span>
+      <span><i style="background:var(--series-p)"></i>P term</span>
+      <span><i style="background:var(--series-i)"></i>I term</span>
+    </div>
+    <div class="chartbox short"><canvas id="chartD" role="img" aria-label="Line chart of heater duty cycle percentage over time">Live heater duty cycle.</canvas></div>
+  </div>
+
+  <div class="card">
+    <h2 style="font-size:16px;font-weight:500;margin:0 0 10px">Latest readings</h2>
+    <table><thead><tr><th>time (s)</th><th>temp (°C)</th><th>setpoint (°C)</th><th>duty (%)</th></tr></thead>
+    <tbody id="tbody"></tbody></table>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+(function () {
+  var css = getComputedStyle(document.documentElement);
+  var V = function (n) { return css.getPropertyValue(n).trim(); };
+  var muted = V('--text-muted'), grid = V('--grid'), axis = V('--axis');
+
+  function mk(canvas, datasets, yOpts) {
+    return new Chart(document.getElementById(canvas), {
+      type: 'line',
+      data: { datasets: datasets },
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        parsing: false, interaction: { mode: 'index', intersect: false },
+        plugins: { legend: { display: false },
+          tooltip: { callbacks: { title: function (i) { return i[0].parsed.x.toFixed(1) + ' s'; } } } },
+        scales: {
+          x: { type: 'linear', title: { display: true, text: 'time (s)', color: muted, font: { size: 12 } },
+               ticks: { color: muted, font: { size: 11 }, maxTicksLimit: 10 },
+               grid: { display: false }, border: { color: axis } },
+          y: Object.assign({ ticks: { color: muted, font: { size: 11 } },
+                             grid: { color: grid }, border: { color: axis } }, yOpts)
+        }
+      }
+    });
+  }
+
+  var chartT = mk('chartT', [
+    { label: 'temperature', borderColor: V('--series-temp'), borderWidth: 2, pointRadius: 0, tension: .2, data: [] },
+    { label: 'setpoint', borderColor: V('--series-sp'), borderWidth: 2, borderDash: [6, 4], pointRadius: 0, stepped: true, data: [] }
+  ], { title: { display: true, text: 'temperature (°C)', color: muted, font: { size: 12 } } });
+
+  var chartD = mk('chartD', [
+    { label: 'duty', borderColor: V('--series-duty'), borderWidth: 2, pointRadius: 0, tension: .2, data: [] },
+    { label: 'P term', borderColor: V('--series-p'), borderWidth: 2, borderDash: [5, 3], pointRadius: 0, tension: .2, data: [] },
+    { label: 'I term', borderColor: V('--series-i'), borderWidth: 2, borderDash: [2, 3], pointRadius: 0, tension: .2, data: [] }
+  ], { min: 0, max: 100, title: { display: true, text: 'duty (%)', color: muted, font: { size: 12 } } });
+
+  var $ = function (id) { return document.getElementById(id); };
+  var banner = $('banner');
+
+  function show(msg) {
+    if (msg) { banner.textContent = msg; banner.style.display = 'block'; }
+    else { banner.style.display = 'none'; }
+  }
+
+  function post(body) {
+    return fetch('/api/command', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      if (j.error) { show(j.error); } else { show(null); }
+      return j;
+    }).catch(function (e) { show('command failed: ' + e); });
+  }
+
+  $('spr').addEventListener('input', function () { $('sp').value = this.value; });
+  $('sp').addEventListener('input', function () { $('spr').value = this.value; });
+  function settings() {
+    return { setpoint_c: parseFloat($('sp').value),
+             kp: parseFloat($('kp').value), ki: parseFloat($('ki').value) };
+  }
+  $('apply').addEventListener('click', function () { post(settings()); });
+  $('start').addEventListener('click', function () {
+    var s = settings(); s.enable = true; post(s);
+  });
+  $('stop').addEventListener('click', function () { post({ enable: false }); });
+
+  var DOT = { 0: 'var(--text-muted)', 1: 'var(--good)', 2: 'var(--crit)', 3: 'var(--crit)', 4: 'var(--warn)' };
+
+  // Adopt whatever the bridge was started with, so the fields are not lying
+  // about the live cap. Only once, and never over a field being edited.
+  var adopted = false;
+  function adopt(cmd) {
+    if (adopted || !cmd) { return; }
+    adopted = true;
+    if (document.activeElement !== $('sp')) { $('sp').value = cmd.setpoint_c; $('spr').value = cmd.setpoint_c; }
+    if (document.activeElement !== $('kp')) { $('kp').value = cmd.kp; }
+    if (document.activeElement !== $('ki')) { $('ki').value = cmd.ki; }
+  }
+
+  function tick() {
+    fetch('/api/state', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (s) {
+      adopt(s.command);
+      var L = s.latest;
+      $('t-temp').textContent = (L.temp_c === null || L.fault) ? '—' : L.temp_c.toFixed(2);
+      $('t-sp').textContent = L.setpoint_c === null ? '—' : L.setpoint_c.toFixed(1);
+      $('t-duty').textContent = L.duty_pct.toFixed(1);
+      $('t-err').textContent = (L.temp_c === null || L.fault) ? '—'
+        : (L.setpoint_c - L.temp_c).toFixed(2);
+      $('t-pi').textContent = L.p_term.toFixed(1) + ' / ' + L.i_term.toFixed(1);
+      $('state').textContent = L.state_name;
+      $('dot').style.background = DOT[L.state] || 'var(--text-muted)';
+      show(s.error ? ('bridge: ' + s.error)
+           : (L.state === 3 ? 'Over-temperature — output latched off. Reset the board to clear.'
+           : (L.state === 2 ? 'Thermocouple fault — heater forced off.' : null)));
+
+      var h = s.history, t = [], sp = [], du = [], pt = [], it = [], rows = '';
+      for (var i = 0; i < h.length; i++) {
+        t.push({ x: h[i][0], y: h[i][1] });
+        sp.push({ x: h[i][0], y: h[i][2] });
+        du.push({ x: h[i][0], y: h[i][3] });
+        pt.push({ x: h[i][0], y: h[i][4] });
+        it.push({ x: h[i][0], y: h[i][5] });
+      }
+      chartT.data.datasets[0].data = t;
+      chartT.data.datasets[1].data = sp;
+      chartD.data.datasets[0].data = du;
+      chartD.data.datasets[1].data = pt;
+      chartD.data.datasets[2].data = it;
+      chartT.update('none'); chartD.update('none');
+
+      for (var j = Math.max(0, h.length - 10); j < h.length; j++) {
+        rows = '<tr><td>' + h[j][0].toFixed(1) + '</td><td>' + h[j][1].toFixed(2) +
+               '</td><td>' + h[j][2].toFixed(1) + '</td><td>' + h[j][3].toFixed(1) + '</td></tr>' + rows;
+      }
+      $('tbody').innerHTML = rows;
+    }).catch(function (e) { show('bridge unreachable: ' + e); });
+  }
+
+  tick();
+  setInterval(tick, 500);
+})();
+</script>
+</body>
+</html>
