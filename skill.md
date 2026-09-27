@@ -107,9 +107,26 @@ never be acted on.
   the driver when it was in fact the problem. Measure **drain to source**, or
   across the element.
 - **SSRs cannot follow fast PWM.** An opto-isolated DC SSR takes roughly a
-  millisecond to switch, so at 200 Hz it never switches cleanly. Use
-  time-proportioned control: `PWM_HZ=1`. Duty resolution stays at 0.05 %
-  because the period is always 2000 counts.
+  millisecond to switch, so at 200 Hz it never switches cleanly. Duty
+  resolution stays at 0.05 % because the period is always 2000 counts.
+  `PWM_HZ` now **defaults to 1**; the old 200 Hz default belonged to the
+  IRF520N and, left in place, is a silent no-op. At 200 Hz a 1 % duty is a
+  48 us pulse, about twenty times shorter than the relay can respond to, so
+  the loop reports a sensible duty and the element gets nothing at all.
+- **`heater_off()` is destructive, so arming again must be explicit.** It stops
+  the timer and reconfigures PA8 as a plain GPIO output low, deliberately, so
+  the pin is held down by the GPIO block even if the timer misbehaves. But
+  `heater_set()` only writes CCR1, which does nothing in that state - so any
+  mode that called `heater_off()` during setup could never produce output
+  again, at any duty. `heater_set()` now re-arms when it is asked for a
+  non-zero duty and finds `TIM1_CEN` clear. Verify with the registers, not the
+  log: the loop happily prints "HEATING duty 1.0 %" with the output dead.
+  `GPIOA_CRH` nibble 0 must read `A`, not `2`, and `CR1` bit 0 must be set.
+- **Very low duties are near the relay's limit.** Holding 41 C needs 0.34 %,
+  which at 1 Hz is a 6.8 ms pulse against a switching time of about 1 ms. It
+  works, but the delivered energy is non-linear down there. If that becomes a
+  problem the answer is a longer time-proportioning window, not a gain change -
+  or a less absurdly oversized element.
 
 ### The plant itself
 

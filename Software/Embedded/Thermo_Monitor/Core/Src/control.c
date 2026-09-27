@@ -44,7 +44,11 @@
  * The period is always 2000 counts, so duty resolution is 0.05% whatever the
  * frequency; only the prescaler changes. */
 #ifndef PWM_HZ
-#define PWM_HZ             200u
+/* Time-proportioned, 1 Hz. The load is an SSR-25DD: it needs roughly a
+ * millisecond to switch, so at 200 Hz a 1 % duty is a 48 us pulse and the
+ * relay simply never turns on. Resolution stays 0.05 % because PWM_PERIOD is
+ * always 2000 counts. The old 200 Hz default belonged to the IRF520N. */
+#define PWM_HZ             1u
 #endif
 #define PWM_PERIOD         2000u
 
@@ -109,6 +113,19 @@ static uint8_t latched_off;
 
 /* ---- Heater ------------------------------------------------------------- */
 
+/* Put PA8 back under the timer. heater_off() deliberately tears that down so
+ * the pin is held low by the GPIO block even if the timer misbehaves, which
+ * means arming again has to be explicit. */
+static void heater_arm(void)
+{
+	GPIO_InitTypeDef gpio = {0};
+	gpio.Pin = GPIO_PIN_8;
+	gpio.Mode = GPIO_MODE_AF_PP;
+	gpio.Speed = GPIO_SPEED_FREQ_LOW;
+	HAL_GPIO_Init(GPIOA, &gpio);
+	HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+}
+
 static void heater_set(float pct)
 {
 	if (latched_off || pct < 0.0f) {
@@ -117,8 +134,13 @@ static void heater_set(float pct)
 	if (pct > DUTY_MAX_PCT) {
 		pct = DUTY_MAX_PCT;
 	}
-	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1,
-	                      (uint32_t)((pct / 100.0f) * (float)PWM_PERIOD));
+	uint32_t cmp = (uint32_t)((pct / 100.0f) * (float)PWM_PERIOD);
+	__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, cmp);
+	/* Writing CCR1 does nothing while the timer is stopped and PA8 is a plain
+	 * GPIO. Commanding real output has to restore both. */
+	if (cmp != 0u && (TIM1->CR1 & TIM_CR1_CEN) == 0u) {
+		heater_arm();
+	}
 }
 
 /* Belt and braces: stop the timer driving the pin and hold PA8 low as a plain
