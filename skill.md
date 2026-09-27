@@ -188,6 +188,15 @@ firmware:
   `x.val=` writes per 250 ms cycle is already a quarter of the link. Send the
   numbers every cycle and the text and colours only when they change,
   otherwise the queue backs up and the screen lags behind the plant.
+- **Never leave `bkcmd=1` on.** It makes the panel return a bare `0x01` after
+  every command, and those acks are single bytes with no terminator. Four
+  telemetry writes per 250 ms cycle fill a 64-byte frame buffer in about four
+  seconds, after which every arriving byte is discarded and no touch code is
+  ever parsed again. The failure is silent and deeply misleading: telemetry is
+  TX-only so the screen keeps updating perfectly, and the dead-man stays happy
+  because bytes *are* arriving - only the parser is jammed. It presents as
+  "the buttons do nothing". Use `bkcmd=0`, and make buffer overflow reset the
+  frame rather than drop the bytes that would have ended it.
 - **Do not poll the UART from the control loop.** The MAX6675 conversion is
   220 ms of a 250 ms cycle and the telemetry writes are blocking on top of it,
   so a polled receive gets almost no time, drops bytes, and the dead-man trips

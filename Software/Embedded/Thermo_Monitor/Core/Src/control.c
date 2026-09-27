@@ -1405,6 +1405,23 @@ void run_control(void)
 
 static uint8_t frame[64];
 static uint32_t frame_n;
+static uint32_t nx_last_byte;
+
+/* Panel diagnostics. Deliberately non-static so `nm` can find the symbol:
+ * OpenOCD reads this through the DAP while the core keeps running, which means
+ * "did that button actually reach the MCU?" can be answered after the fact
+ * instead of by pressing a key inside a log capture window. */
+volatile struct {
+	uint32_t bytes;      /* every byte the ISR has seen */
+	uint32_t frames;     /* completed frames of any kind */
+	uint32_t ascii;      /* CR LF terminated frames, i.e. touch codes */
+	uint32_t starts;     /* p0b20 decoded */
+	uint32_t stops;      /* p0b21 decoded */
+	uint32_t applies;    /* SP= / KP= / KI= decoded */
+	uint32_t unknown;    /* ASCII frame we did not recognise */
+	uint32_t overflows;  /* frame buffer reset because it filled */
+	char     last[32];   /* most recent decoded code */
+} g_nx;
 static int nx_page = PG_MONITOR;        /* monitor is the boot page */
 static int nx_enable = 0;
 static volatile uint32_t nx_last_rx;
@@ -1446,6 +1463,9 @@ static void nx_report(const uint8_t *f, uint32_t n)
 			}
 		}
 
+		g_nx.ascii++;
+		snprintf((char *)g_nx.last, sizeof(g_nx.last), "%.31s", code);
+
 		const char *sp = strstr(code, "SP=");
 		const char *kp = strstr(code, "KP=");
 		const char *ki = strstr(code, "KI=");
@@ -1459,22 +1479,38 @@ static void nx_report(const uint8_t *f, uint32_t n)
 			         (long)(nx_kp_milli / 1000), (long)(nx_kp_milli % 1000),
 			         (long)(nx_ki_milli / 1000), (long)(nx_ki_milli % 1000));
 			emit_dbg(line);
+			g_nx.applies++;
 			return;
 		}
-		if (!strcmp(code, "p0b20")) {
+		if (strstr(code, "p0b20")) {
 			nx_enable = 1;
+			g_nx.starts++;
 			emit_dbg("  START\r\n");
-		} else if (!strcmp(code, "p0b21")) {
+		} else if (strstr(code, "p0b21")) {
 			nx_enable = 0;
+			g_nx.stops++;
 			emit_dbg("  STOP\r\n");
-		} else if (!strcmp(code, "p0b10")) {
+		} else if (strstr(code, "p0b10")) {
 			nx_page = PG_MONITOR;
-		} else if (!strcmp(code, "p0b11")) {
+		} else if (strstr(code, "p0b11")) {
 			nx_page = PG_SETUP;
-		} else if (!strcmp(code, "p0b12")) {
+		} else if (strstr(code, "p0b12")) {
 			nx_page = PG_TREND;
 			nx_tx("cle 1,255");          /* fresh trace on entry */
+		} else {
+			/* Worth a line: a button that arrives but is not understood looks
+			 * exactly like one that was never sent. */
+			g_nx.unknown++;
+			snprintf(line, sizeof(line), "  rx \"%s\"\r\n", code);
+			emit_dbg(line);
 		}
+		return;
+	}
+
+	/* 66 <page> FF FF FF, the reply to `sendme`. Trust it over the nav codes:
+	 * it also reports the keyboard page, which no nav button announces. */
+	if (n >= 2u && f[0] == 0x66) {
+		nx_page = (int)f[1];
 	}
 }
 
@@ -1496,6 +1532,7 @@ void USART1_IRQHandler(void)
 			nx_head = h;
 		}
 		nx_last_rx = HAL_GetTick();
+		g_nx.bytes++;
 	}
 }
 
@@ -1506,6 +1543,11 @@ static void nx_pump(uint32_t ms)
 	uint32_t until = HAL_GetTick() + ms;
 	for (;;) {
 		if (nx_tail == nx_head) {
+			/* Stray status bytes carry no terminator. Drop a stalled partial
+			 * so it cannot prefix the next real frame. */
+			if (frame_n && (HAL_GetTick() - nx_last_byte) > 100u) {
+				frame_n = 0;
+			}
 			if ((int32_t)(HAL_GetTick() - until) >= 0) {
 				return;
 			}
@@ -1513,9 +1555,12 @@ static void nx_pump(uint32_t ms)
 		}
 		uint8_t b = nx_ring[nx_tail];
 		nx_tail = (uint8_t)(nx_tail + 1u);
-		if (frame_n < sizeof(frame)) {
-			frame[frame_n++] = b;
+		if (frame_n >= sizeof(frame)) {
+			frame_n = 0;        /* junk: start over rather than jam forever */
+			g_nx.overflows++;
 		}
+		frame[frame_n++] = b;
+		nx_last_byte = HAL_GetTick();
 		int done = 0;
 		if (frame_n >= 3u && frame[frame_n - 1] == 0xFF &&
 		    frame[frame_n - 2] == 0xFF && frame[frame_n - 3] == 0xFF) {
@@ -1526,6 +1571,7 @@ static void nx_pump(uint32_t ms)
 			done = 1;
 		}
 		if (done) {
+			g_nx.frames++;
 			if (frame_n) {
 				nx_report(frame, frame_n);
 			}
@@ -1563,7 +1609,11 @@ void run_control(void)
 	HAL_NVIC_EnableIRQ(USART1_IRQn);
 
 	nx_pump(150);
-	nx_tx("bkcmd=1");
+	/* bkcmd=0, emphatically. At bkcmd=1 the panel returns a bare 0x01 after
+	 * every command, and those are unterminated single bytes: four per cycle
+	 * saturate the frame buffer in about four seconds, after which no touch
+	 * code is ever parsed again. We never read the acks, so do not ask. */
+	nx_tx("bkcmd=0");
 	nx_pump(150);
 	nx_txt("tMode", "CONSTANT");
 	nx_pump(100);
