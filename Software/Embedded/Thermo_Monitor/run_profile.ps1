@@ -14,7 +14,7 @@
 # timeout), but keep the 24 V supply within reach anyway.
 
 param(
-    [ValidateSet('step', 'pi', 'hold', 'monitor', 'hmi', 'tx', 'rx')]
+    [ValidateSet('step', 'pi', 'hold', 'monitor', 'hmi', 'tx', 'rx', 'nextion')]
     [string]$Mode = 'pi',
     [int]$Seconds = 0,
     [double]$Kp = 0,
@@ -46,6 +46,7 @@ if ($Seconds -le 0) {
     elseif ($Mode -eq 'hmi')  { $Seconds = 45 }
     elseif ($Mode -eq 'tx')   { $Seconds = 120 }
     elseif ($Mode -eq 'rx')   { $Seconds = 120 }
+    elseif ($Mode -eq 'nextion') { $Seconds = 120 }
     elseif ($Mode -eq 'pi')  { $Seconds = 200 }
     else                     { $Seconds = 30 }
 }

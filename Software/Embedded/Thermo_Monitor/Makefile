@@ -59,6 +59,10 @@ endif
 ifeq ($(MODE),rx)
 DEFS += -DCONTROL_MODE=7
 endif
+# make MODE=nextion -> drive Devin's HMI, log its touch codes, no heating
+ifeq ($(MODE),nextion)
+DEFS += -DCONTROL_MODE=8
+endif
 # Retune without touching the source:  make MODE=pi KP=8.0 KI=0.4
 ifdef KP
 DEFS += -DKP_RAW=$(KP)

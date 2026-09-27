@@ -53,7 +53,9 @@ flowchart LR
 Two board quirks worth knowing before wiring anything:
 
 - **J4 (the 5 V serial header) does not work.** Its BSS138 level shifters are
-  rotated one pin position. Use **TP5 / TP6** instead, which are plain 3.3 V.
+  rotated one pin position, so a signal arriving there reaches only a MOSFET
+  gate - there is no DC path to the MCU. Go directly to **PA9 / PA10**
+  (TP6 / TP5). No level shifting is needed in either direction.
 - **SW1 selects BOOT0.** In the +3.3 V position the part boots from SRAM and
   never runs your firmware. It belongs in the **GND** position.
 
@@ -106,7 +108,8 @@ The firmware builds in several modes, selected at compile time:
 | `step` | open-loop step at a fixed duty, for plant characterisation |
 | `hold` | park the output at a duty so the driver can be probed |
 | `server` | PI loop steered from the host over SWD - used by the web app |
-| `hmi` | Nextion first-contact probe |
+| `nextion` | drives the Nextion panel: pushes live temperature, parses Apply, logs touch codes. Does not heat |
+| `hmi` | Nextion first-contact probe - baud sweep, pin checks, frame dump |
 | `tx` / `rx` | continuous transmit / raw receive capture, for tracing wiring |
 
 ---
@@ -117,10 +120,15 @@ The firmware builds in several modes, selected at compile time:
 the MCU, web app with live charts and a dead-man switch, all the safety
 cutoffs.
 
-**In progress:** the Nextion panel. It powers up and runs its factory demo,
-but no UART traffic has been established in either direction yet. What has
-already been ruled out is written up in `skill.md` - read that before
-re-testing anything.
+**Working on the panel:** serial is up. Wire it **straight to PA9 / PA10** -
+not J4, whose level shifters are miswired. The panel answers `sendme` at
+9600, `dim=` visibly changes the backlight, and `MODE=nextion` pushes live
+temperature to the screen and parses the Apply button's
+`SP=###,KP=###,KI=###` string.
+
+**Remaining on the panel:** its Start and Stop buttons emit nothing, so the
+HMI needs `print` statements adding to them before the display can arm the
+heater. See `Software/Display/INTERFACE.md`.
 
 **Not started:** reflow profiles proper (soak / ramp / peak / cool),
 enclosure, mains-side safety.

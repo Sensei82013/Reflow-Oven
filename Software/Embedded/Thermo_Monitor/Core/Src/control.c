@@ -28,6 +28,7 @@
 #include "thermo.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #if CONTROL_MODE
 
@@ -591,7 +592,11 @@ void run_control(void)
 /* The shipped Reflow.HMI contains `baud=38400` but also `bauds=115200`
  * and `bauds=250000` - and `bauds` writes the rate permanently, so the
  * panel may well not be at 38400 any more. Most likely first. */
-__attribute__((unused)) static const uint32_t probe_bauds[] = { 9600 };  /* the panel's
+__attribute__((unused)) static const uint32_t probe_bauds[] = {
+	/* A new HMI can change the stored rate via `bauds=` in its Program.s,
+	 * so do not trust the last known value. Most likely first. */
+	9600, 115200, 38400, 57600, 19200, 230400, 250000, 921600
+};  /* the panel's
 	* own settings page reports bauds: 9600, so stop guessing */
 #define N_BAUDS (sizeof(probe_bauds) / sizeof(probe_bauds[0]))
 
@@ -604,7 +609,7 @@ __attribute__((unused)) static const uint32_t probe_bauds[] = { 9600 };  /* the 
  * low, and for a high it simply lets go and the panel's own pull-up takes
  * the line to a clean 5 V. Rise time is a microsecond or so against that
  * pull-up, which is nothing next to a 104 us bit at 9600. */
-static void nx_tx_open_drain(void)
+__attribute__((unused)) static void nx_tx_open_drain(void)
 {
 	GPIO_InitTypeDef g = {0};
 	g.Pin = GPIO_PIN_9;
@@ -621,7 +626,6 @@ static void uart_set_baud(uint32_t baud)
 	if (HAL_UART_Init(&huart1) != HAL_OK) {
 		Error_Handler();
 	}
-	nx_tx_open_drain();   /* HAL_UART_Init resets PA9 to push-pull */
 }
 
 static void nx_send(const char *cmd)
@@ -939,9 +943,87 @@ static void pa10_pulldown_test(void)
 }
 
 
-void run_control(void)
+/* What is the 3.3 V rail actually at?
+ *
+ * Both UART pins reading 2.6 V with nothing plugged in is the giveaway. R6
+ * and R9 are 10k pull-ups to +3.3 V, so an idle pin should sit at the rail.
+ * If it sits at 2.6 V, the rail is at 2.6 V - and an AMS1117 with ~1.1 V of
+ * dropout produces exactly that from a VBUS sagging to ~3.7 V under the
+ * panel's 430 mA.
+ *
+ * The STM32 can measure its own supply without any external help: ADC
+ * channel 17 is an internal 1.20 V bandgap reference, and the ADC measures
+ * it as a fraction of VDDA. So VDD = 1.20 * 4095 / raw.
+ *
+ * Done with raw registers because the ADC HAL files are not in this project.
+ */
+static void report_vdd(void)
 {
 	char line[180];
+
+	__HAL_RCC_ADC1_CLK_ENABLE();
+	/* ADC clock must be <= 14 MHz and PCLK2 is 64 MHz, so divide by 6. */
+	RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_ADCPRE) | RCC_CFGR_ADCPRE_DIV6;
+
+	ADC1->CR2 = ADC_CR2_ADON;                 /* wake the ADC */
+	HAL_Delay(2);
+	ADC1->CR2 |= ADC_CR2_TSVREFE;             /* connect VREFINT / temp sensor */
+	HAL_Delay(2);
+
+	ADC1->CR2 |= ADC_CR2_RSTCAL;
+	while (ADC1->CR2 & ADC_CR2_RSTCAL) {
+	}
+	ADC1->CR2 |= ADC_CR2_CAL;
+	while (ADC1->CR2 & ADC_CR2_CAL) {
+	}
+
+	/* channel 17, longest sample time - the bandgap needs >= 17.1 us */
+	ADC1->SMPR1 = (ADC1->SMPR1 & ~(7u << 21)) | (7u << 21);
+	ADC1->SQR1 = 0;
+	ADC1->SQR3 = 17u;
+	ADC1->CR2 |= ADC_CR2_EXTSEL | ADC_CR2_EXTTRIG;   /* SWSTART */
+
+	uint32_t sum = 0;
+	const int N = 16;
+	for (int i = 0; i < N; i++) {
+		ADC1->SR = 0;
+		ADC1->CR2 |= ADC_CR2_SWSTART;
+		uint32_t guard = 0;
+		while (!(ADC1->SR & ADC_SR_EOC) && ++guard < 1000000u) {
+		}
+		sum += ADC1->DR & 0x0FFFu;
+	}
+	uint32_t raw = sum / N;
+
+	if (raw == 0u) {
+		emit_dbg("   ADC gave nothing - cannot read VDD\r\n");
+		return;
+	}
+
+	uint32_t vdd_mv = (1200u * 4095u) / raw;
+	snprintf(line, sizeof(line), "   VREFINT raw %lu  ->  VDD = %lu.%03lu V\r\n",
+	         (unsigned long)raw,
+	         (unsigned long)(vdd_mv / 1000u), (unsigned long)(vdd_mv % 1000u));
+	emit_dbg(line);
+
+	if (vdd_mv < 3000u) {
+		emit_dbg("   -> THE RAIL IS LOW. The AMS1117 is dropping out, which means\r\n"
+		         "      VBUS is sagging - almost certainly the panel's 430 mA\r\n"
+		         "      pulled through the micro-USB and the PCB. Every logic high\r\n"
+		         "      we drive is only this high, which is why the panel cannot\r\n"
+		         "      read us. Give the display its own 5 V supply.\r\n");
+	} else if (vdd_mv > 3600u) {
+		emit_dbg("   -> rail is high; check the regulator.\r\n");
+	} else {
+		emit_dbg("   -> rail is healthy, so the 2.6 V on the UART pins is not a\r\n"
+		         "      supply problem and something else is loading them.\r\n");
+	}
+}
+
+
+void run_control(void)
+{
+	char line[200];
 	uint8_t buf[192];
 
 	heater_init();
@@ -949,7 +1031,7 @@ void run_control(void)
 	dwt_init();
 	uart_set_baud(9600);
 
-	emit_dbg("\r\n=== Nextion probe at 9600 ===\r\n"
+	emit_dbg("\r\n=== Nextion probe ===\r\n"
 	         "PA9 = TX (TP6), PA10 = RX (TP5)\r\n");
 
 	/* --- is our own TX pin actually moving? ----------------------------
@@ -958,14 +1040,17 @@ void run_control(void)
 	 * NVIC line, so the interrupt-driven call queues a transfer that can
 	 * never run, leaves gState stuck at BUSY_TX, and silently turns every
 	 * later HAL_UART_Transmit into a no-op. Polling TXE avoids all that. */
+	emit_dbg("\r\n[0] what is the 3.3 V rail actually at?\r\n");
+	report_vdd();
+
 	emit_dbg("\r\n[1] is PA9 toggling while USART1 transmits?\r\n");
 	{
 		uint32_t hi = 0, lo = 0;
 		for (int c = 0; c < 40; c++) {
 			while (!(huart1.Instance->SR & USART_SR_TXE)) {
 			}
-			huart1.Instance->DR = 0x55;      /* alternating bits: most edges */
-			for (int k = 0; k < 400; k++) {  /* sample inside the character */
+			huart1.Instance->DR = 0x55;
+			for (int k = 0; k < 400; k++) {
 				if (GPIOA->IDR & GPIO_PIN_9) {
 					hi++;
 				} else {
@@ -975,16 +1060,10 @@ void run_control(void)
 		}
 		while (!(huart1.Instance->SR & USART_SR_TC)) {
 		}
-		snprintf(line, sizeof(line), "   PA9 high %lu, low %lu samples\r\n",
-		         (unsigned long)hi, (unsigned long)lo);
+		snprintf(line, sizeof(line), "   PA9 high %lu, low %lu -> %s\r\n",
+		         (unsigned long)hi, (unsigned long)lo,
+		         lo ? "driving both ways, MCU is sending" : "NEVER LOW, not transmitting");
 		emit_dbg(line);
-		if (lo == 0u) {
-			emit_dbg("   -> PA9 never goes low: the pin really is not driving.\r\n");
-		} else {
-			emit_dbg("   -> PA9 drives both ways, so the MCU is sending. If the\r\n"
-			         "      panel still never answers, the break is between TP6\r\n"
-			         "      and the display's RX pin.\r\n");
-		}
 	}
 
 	/* --- is the display's TX present on PA10? --------------------------- */
@@ -993,79 +1072,85 @@ void run_control(void)
 	pa10_pulldown_test();
 	uart_set_baud(9600);
 
-	/* --- ask it to identify itself ------------------------------------- */
-	emit_dbg("\r\n[3] asking the panel to reply.\r\n"
-	         "    'sendme' returns 66 <page> FF FF FF on any HMI;\r\n"
-	         "    bkcmd=3 makes every command ack with 01 FF FF FF.\r\n");
-	nx_collect(buf, sizeof(buf), 100);
-	nx_send("bkcmd=3");
-	int n = nx_collect(buf, sizeof(buf), 300);
-	snprintf(line, sizeof(line), "   bkcmd=3 -> %d bytes\r\n", n);
-	emit_dbg(line);
-	if (n) {
-		dump(buf, n);
-	}
-	nx_send("sendme");
-	n = nx_collect(buf, sizeof(buf), 400);
-	snprintf(line, sizeof(line), "   sendme  -> %d bytes\r\n", n);
-	emit_dbg(line);
-	if (n) {
-		dump(buf, n);
+	/* --- sweep every plausible rate asking for a reply -------------------
+	 * A freshly uploaded HMI can change the stored rate through `bauds=` in
+	 * its Program.s, so the last known value proves nothing. 'sendme'
+	 * returns 66 <page> FF FF FF on any HMI regardless of bkcmd, which is
+	 * why it is the probe of choice. */
+	emit_dbg("\r\n[3] sweeping baud rates, asking each for a reply:\r\n");
+	uint32_t found = 0;
+	for (unsigned pass = 0; pass < 3u && !found; pass++) {
+		for (unsigned i = 0; i < N_BAUDS; i++) {
+			uart_set_baud(probe_bauds[i]);
+			HAL_Delay(30);
+			nx_collect(buf, sizeof(buf), 60);
+
+			nx_send("");            /* terminator: close any partial command */
+			nx_send("bkcmd=3");
+			nx_send("sendme");
+			int n = nx_collect(buf, sizeof(buf), 350);
+
+			snprintf(line, sizeof(line), "   %7lu baud -> %d bytes%s\r\n",
+			         (unsigned long)probe_bauds[i], n, n ? "   <-- REPLY" : "");
+			emit_dbg(line);
+			if (n) {
+				dump(buf, n);
+				found = probe_bauds[i];
+				break;
+			}
+		}
+		if (!found && pass == 0u) {
+			emit_dbg("   (nothing yet - repeating, power-cycle the panel now\r\n"
+			         "    if you want to catch its startup message)\r\n");
+		}
 	}
 
-	/* --- keep trying, and keep the backlight pulsing -------------------- */
-	emit_dbg("\r\n[4] looping. Watch the screen for a slow pulse - that means\r\n"
-	         "    our TX is landing. Any bytes received appear below.\r\n"
-	         "    Power-cycling the panel now should emit 00 00 00 FF FF FF.\r\n\r\n");
+	if (found) {
+		snprintf(line, sizeof(line),
+		         "\r\n*** PANEL ANSWERED AT %lu BAUD ***\r\n", (unsigned long)found);
+		emit_dbg(line);
+		uart_set_baud(found);
+		nx_send("bkcmd=3");
+		nx_send("page 0");
+	} else {
+		emit_dbg("\r\nNo reply at any rate.\r\n");
+		uart_set_baud(9600);
+	}
+
+	/* --- keep listening, and keep something visible happening ----------- */
+	emit_dbg("\r\n[4] listening. Touch the panel; codes appear below.\r\n"
+	         "    Backlight pulses so our TX direction stays testable.\r\n\r\n");
 
 	uint32_t iter = 0;
 	int ever_rx = 0;
 	for (;;) {
-		nx_send("sendme");
-		n = nx_collect(buf, sizeof(buf), 400);
+		int n = nx_collect(buf, sizeof(buf), 400);
 		if (n) {
 			ever_rx = 1;
 			emit_dbg("   <-- BYTES:\r\n");
 			dump(buf, n);
 		}
 
-		if ((iter % 4u) == 0u) {
-			nx_send("dim=15");
-		} else if ((iter % 4u) == 2u) {
+		if ((iter % 6u) == 0u) {
+			nx_send("dim=20");
+		} else if ((iter % 6u) == 3u) {
 			nx_send("dim=100");
 		}
+		if ((iter % 4u) == 1u) {
+			nx_send("sendme");
+		}
 
-		if ((iter % 8u) == 7u) {
-			snprintf(line, sizeof(line), "   ... %lu tries, bytes seen: %s\r\n",
+		if ((iter % 12u) == 11u) {
+			snprintf(line, sizeof(line), "   ... %lu polls, bytes seen: %s\r\n",
 			         (unsigned long)iter + 1u, ever_rx ? "YES" : "no");
 			emit_dbg(line);
 		}
 		iter++;
-		HAL_Delay(500);
+		HAL_Delay(250);
 	}
 }
 
 
-/* ---- Mode 6: continuous TX, for tracing with a meter --------------------
- * Hammers 0x55 out of PA9 at 9600 with no gaps between characters. In 8N1
- * that frame is start,1,0,1,0,1,0,1,0,stop - five low bits and five high -
- * so the line sits at a 50% duty square wave and an ordinary DC multimeter
- * reads about half of 3.3 V on it.
- *
- * That gives a signal you can chase with nothing but a meter:
- *
- *     idle (not sending)   ~3.3 V
- *     sending 0x55         ~1.6 V
- *
- * It alternates between the two every three seconds and prints which state
- * it is in, so a reading that tracks the printout is definitely our signal
- * and not something else on the bench.
- *
- * Probe TP6 first to confirm the board end, then the display's RX pin. The
- * same ~1.6 V at both ends means the wire is good and the problem is at the
- * display; 3.3 V at the far end while TP6 swings means the wire is not
- * carrying it.
- */
 #elif CONTROL_MODE == 6
 
 #ifndef TX_BAUD
@@ -1081,7 +1166,7 @@ void run_control(void)
  * low, and for a high it simply lets go and the panel's own pull-up takes
  * the line to a clean 5 V. Rise time is a microsecond or so against that
  * pull-up, which is nothing next to a 104 us bit at 9600. */
-static void nx_tx_open_drain(void)
+__attribute__((unused)) static void nx_tx_open_drain(void)
 {
 	GPIO_InitTypeDef g = {0};
 	g.Pin = GPIO_PIN_9;
@@ -1104,7 +1189,6 @@ void run_control(void)
 	if (HAL_UART_Init(&huart1) != HAL_OK) {
 		Error_Handler();
 	}
-	nx_tx_open_drain();
 
 	snprintf(line, sizeof(line),
 	         "\r\n=== continuous TX on PA9 (TP6) at %lu baud ===\r\n"
@@ -1269,6 +1353,246 @@ void run_control(void)
 			}
 		}
 		idle_report = HAL_GetTick() + 5000u;
+	}
+}
+
+
+/* ---- Mode 8: Nextion integration ----------------------------------------
+ * Drives Devin's HMI (see Software/Display/INTERFACE.md):
+ *
+ *   MCU writes   xPV  xSP  xDuty  xErr        (all scaled x10)
+ *   MCU reads    xSPset (x10)  xKp  xKi       (both x1000)
+ *
+ * The panel runs at 9600 with recmod=0, so it only speaks when spoken to -
+ * apart from touch events and its power-on banner.
+ *
+ * This build deliberately does NOT heat. Its job is to bring the screen to
+ * life with real temperature and to log every frame the panel sends, so the
+ * button codes for Start/Stop/Apply can be read off the wire - they were not
+ * recoverable from the compiled .tft. Once those are known the PI loop drops
+ * straight in, because g_cmd/g_srv already carry exactly these fields.
+ *
+ * Frames are assembled properly rather than dumped per read: Nextion binary
+ * replies end in FF FF FF, and this HMI's touch codes are five ASCII
+ * characters followed by CR LF.
+ */
+#elif CONTROL_MODE == 8
+
+#define NX_BAUD  9600u
+
+static uint8_t frame[64];
+static int nx_on_monitor = 1;
+static int32_t nx_sp_x10 = 300;     /* what the panel last applied */
+static int32_t nx_kp_milli = 200;
+static int32_t nx_ki_milli = 2;
+static uint32_t frame_n;
+
+static void nx_tx(const char *cmd)
+{
+	static const uint8_t term[3] = { 0xFF, 0xFF, 0xFF };
+	HAL_UART_Transmit(&huart1, (uint8_t *)cmd, strlen(cmd), 200);
+	HAL_UART_Transmit(&huart1, (uint8_t *)term, 3, 100);
+}
+
+static void nx_set(const char *obj, int32_t value)
+{
+	char buf[48];
+	snprintf(buf, sizeof(buf), "%s.val=%ld", obj, (long)value);
+	nx_tx(buf);
+}
+
+/* Decode one complete frame and say what it means. */
+static void nx_report(const uint8_t *f, uint32_t n)
+{
+	char line[180];
+	int m = snprintf(line, sizeof(line), "  rx:");
+	for (uint32_t i = 0; i < n && i < 16u; i++) {
+		m += snprintf(line + m, sizeof(line) - m, " %02X", f[i]);
+	}
+
+	/* Devin's touch codes are printable ASCII terminated by CR LF. */
+	if (n >= 3u && f[n - 2] == 0x0D && f[n - 1] == 0x0A) {
+		char code[80] = {0};
+		uint32_t c = 0;
+		for (uint32_t i = 0; i < n - 2u && c < sizeof(code) - 1u; i++) {
+			if (f[i] >= 32 && f[i] < 127) {
+				code[c++] = (char)f[i];
+			}
+		}
+		/* Apply sends the whole parameter set in one go. Scaling confirmed
+		 * against the panel: SP is x10 (515 = 51.5 C), KP and KI are x1000. */
+		const char *sp = strstr(code, "SP=");
+		const char *kp = strstr(code, "KP=");
+		const char *ki = strstr(code, "KI=");
+		if (sp || kp || ki) {
+			if (sp) { nx_sp_x10   = atoi(sp + 3); }
+			if (kp) { nx_kp_milli = atoi(kp + 3); }
+			if (ki) { nx_ki_milli = atoi(ki + 3); }
+			snprintf(line + m, sizeof(line) - m,
+			         "   APPLY: setpoint %ld.%ld C, Kp %ld.%03ld, Ki %ld.%03ld\r\n",
+			         (long)(nx_sp_x10 / 10), (long)(nx_sp_x10 % 10),
+			         (long)(nx_kp_milli / 1000), (long)(nx_kp_milli % 1000),
+			         (long)(nx_ki_milli / 1000), (long)(nx_ki_milli % 1000));
+			emit_dbg(line);
+			return;
+		}
+		snprintf(line + m, sizeof(line) - m, "   TOUCH CODE \"%s\"\r\n", code);
+		emit_dbg(line);
+		/* p0b10 = monitor, p0b11 = setup, p0b12 = trend. The panel changes
+		 * page itself; we only track it so we do not write objects that are
+		 * not loaded. */
+		if (code[0] == 0x70 && code[1] == 0x30 && code[2] == 0x62) {
+			if (code[3] == 0x31 && code[4] == 0x30) { nx_on_monitor = 1; }
+			else if (code[3] == 0x31) { nx_on_monitor = 0; }
+		}
+		return;
+	}
+
+	switch (f[0]) {
+	case 0x66:
+		snprintf(line + m, sizeof(line) - m, "   current page = %u\r\n",
+		         n > 1u ? f[1] : 0u);
+		break;
+	case 0x65:
+		snprintf(line + m, sizeof(line) - m,
+		         "   touch: page %u component %u %s\r\n",
+		         n > 1u ? f[1] : 0u, n > 2u ? f[2] : 0u,
+		         (n > 3u && f[3]) ? "press" : "release");
+		break;
+	case 0x71: {
+		int32_t v = 0;
+		if (n >= 5u) {
+			v = (int32_t)((uint32_t)f[1] | ((uint32_t)f[2] << 8) |
+			              ((uint32_t)f[3] << 16) | ((uint32_t)f[4] << 24));
+		}
+		snprintf(line + m, sizeof(line) - m, "   value = %ld\r\n", (long)v);
+		break;
+	}
+	case 0x01:
+		snprintf(line + m, sizeof(line) - m, "   ok\r\n");
+		break;
+	case 0x00:
+		snprintf(line + m, sizeof(line) - m, "   panel booted\r\n");
+		break;
+	default:
+		snprintf(line + m, sizeof(line) - m, "   (return code %02X)\r\n", f[0]);
+		break;
+	}
+	emit_dbg(line);
+}
+
+/* Pull bytes for `ms`, emitting each complete frame as it lands. */
+static void nx_pump(uint32_t ms)
+{
+	uint32_t until = HAL_GetTick() + ms;
+	while ((int32_t)(HAL_GetTick() - until) < 0) {
+		if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)) {
+			__HAL_UART_CLEAR_OREFLAG(&huart1);
+		}
+		if (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE)) {
+			continue;
+		}
+		uint8_t b = (uint8_t)(huart1.Instance->DR & 0xFF);
+		if (frame_n < sizeof(frame)) {
+			frame[frame_n++] = b;
+		}
+
+		int done = 0;
+		if (frame_n >= 3u && frame[frame_n - 1] == 0xFF &&
+		    frame[frame_n - 2] == 0xFF && frame[frame_n - 3] == 0xFF) {
+			frame_n -= 3u;              /* drop the terminator */
+			done = 1;
+		} else if (frame_n >= 2u && frame[frame_n - 1] == 0x0A &&
+		           frame[frame_n - 2] == 0x0D) {
+			done = 1;
+		}
+		if (done) {
+			if (frame_n) {
+				nx_report(frame, frame_n);
+			}
+			frame_n = 0;
+		}
+	}
+}
+
+void run_control(void)
+{
+	char line[180];
+
+	/* Read-only for now: the element stays off while the UI is wired up. */
+	heater_init();
+	heater_off();
+
+	HAL_UART_DeInit(&huart1);
+	huart1.Init.BaudRate = NX_BAUD;
+	if (HAL_UART_Init(&huart1) != HAL_OK) {
+		Error_Handler();
+	}
+
+	emit_dbg("\r\n=== Nextion integration (no heating) ===\r\n"
+	         "  pushing xPV / xSP / xDuty / xErr to the panel\r\n"
+	         "  polling xSPset / xKp / xKi back\r\n"
+	         "  PRESS EVERY BUTTON - codes are logged below\r\n\r\n");
+
+	nx_pump(150);
+	nx_tx("bkcmd=1");          /* ack only failures: less chatter to wade through */
+	nx_pump(150);
+	nx_tx("page monitor");
+	nx_pump(300);
+
+	/* Which of these names actually resolve? A `get` on a name the panel
+	 * does not know returns 1A ("variable name invalid"), and page-local
+	 * objects only resolve while their page is loaded - which is why the
+	 * first run produced 200 of them once the nav buttons were pressed. */
+	emit_dbg("  probing variable names (71 = exists, 1A = unknown):\r\n");
+	{
+		static const char *names[] = {
+			"xPV", "xSP", "xDuty", "xErr", "xSPset", "xKp", "xKi"
+		};
+		for (unsigned k = 0; k < sizeof(names) / sizeof(names[0]); k++) {
+			char q[48];
+			snprintf(q, sizeof(q), "get %s.val", names[k]);
+			snprintf(line, sizeof(line), "    %-8s -> ", names[k]);
+			emit_dbg(line);
+			nx_tx(q);
+			nx_pump(250);
+		}
+	}
+
+
+	uint32_t iter = 0;
+
+	for (;;) {
+		/* --- temperature --------------------------------------------- */
+		uint16_t raw;
+		int ok = (max6675_read(&raw) == FAULT_NONE);
+		/* The panel divides by 100: pushing 265 showed 2.6 on screen, and
+		 * Devin's own placeholder was xPV = 2575 for 25.75 C. So send
+		 * hundredths, not tenths. */
+		int32_t pv_x100 = ok ? (max6675_milli_c(raw) / 10) : 0;
+
+		if (nx_on_monitor) {
+			nx_set("xPV", pv_x100);
+			nx_set("xSP", nx_sp_x10 * 10);      /* x10 -> x100 */
+			nx_set("xDuty", 0);
+			nx_set("xErr", (nx_sp_x10 * 10) - pv_x100);
+		}
+		nx_pump(120);
+
+		/* The setup-page variables are page-local, so polling them from
+		 * the monitor page just returns 1A. Devin's Apply button pushes
+		 * "SP=###,KP=###,KI=###" instead, which needs no polling at all -
+		 * that is parsed in nx_report(). */
+
+		if ((iter % 4u) == 0u) {
+			snprintf(line, sizeof(line), "  PV %ld.%ld C%s\r\n",
+			         (long)(pv_x100 / 100), (long)((pv_x100 / 10) % 10),
+			         ok ? "" : "  (sensor fault)");
+			emit_dbg(line);
+		}
+
+		nx_pump(250);
+		iter++;
 	}
 }
 

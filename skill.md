@@ -147,46 +147,40 @@ is only two counts at a thousandth - not enough resolution to tune with.
 does the real work. Note also that the element position and insulation are
 expected to change, so do not over-tune the current rig.
 
-### Nextion panel - unresolved
+### Nextion panel
+
+**Wire the panel straight to PA9 / PA10. That works.**
+
+| Panel | Board |
+|---|---|
+| TX | **PA10** (TP5) - 5 V tolerant, no level shifter needed |
+| RX | **PA9** (TP6) - 3.3 V drive is sufficient |
+| GND | board GND |
+| 5 V | its own supply - 430 mA typical, 1 A recommended |
+
+**Do not use J4.** Its BSS138 shifters have the pins rotated one position, so
+a signal arriving there lands on a MOSFET gate and there is simply no DC path
+to the MCU. Everything else - baud, levels, grounds - was a red herring; this
+was the whole problem, and it cost a lot of time. TP5/TP6 sit directly on the
+MCU nets with nothing in between.
+
+Confirmed working once moved: the panel answers `sendme` with
+`66 00 FF FF FF` at 9600, and `dim=` visibly changes the backlight.
 
 The panel is an **NX8048P070-011C**: 7", 800x480, capacitive, *Intelligent*
-series. Default baud **9600**, 430 mA at full brightness, **5 V at 1 A
-recommended, no USB power** - it ships with a separate power board because the
-4-pin serial connector is not meant to carry that current.
+series, default baud 9600, **no USB power**.
 
-State: the panel boots, runs its factory demo, and its settings page reports
-`bauds: 9600`. **No UART traffic has been established in either direction.**
+See `Software/Display/INTERFACE.md` for the full object map. The two things
+that shape the firmware:
 
-Already ruled out, so do not redo these:
-
-- Baud - swept 9600 / 19200 / 38400 / 57600 / 115200 / 230400 / 250000.
-- Orientation - tested physically *and* in software by bit-banging the
-  opposite pin.
-- Our TX pin - PA9 verifiably drives both high and low while USART1 transmits.
-- Panel power - confirmed good, full brightness, touch works.
-- Receive path - PA10 idles high, sinks cleanly, and shows **zero** lows in
-  1.6 M samples. A power-cycle produced only four ~730 ns spikes milliseconds
-  apart, which is coupled noise from the 5 V rail, not UART framing.
-
-Measured levels: display RX sits at **3.2 V** (our PA9 holding it down),
-display TX at **4.6 V**.
-
-The open question is whether our 3.3 V high clears the panel's input
-threshold. Note two traps if you chase that:
-
-- **R9 is a 10 k pull-up to +3.3 V on the TX net.** Switching PA9 to
-  open-drain therefore does *not* let the panel's 5 V pull-up take the line
-  high - R9 clamps it to 3.3 V. That idea was tried and failed for this
-  reason.
-- **The direction matters.** PA10 receiving the panel's 5 V TX needs nothing,
-  because PA10 is 5 V tolerant. Only PA9 driving the panel's RX is an
-  up-shift. Tolerance protects an input; it never helps an output reach
-  higher than VDD.
-
-**Recommended next step:** connect the panel to a USB-TTL adapter and open the
-Nextion Editor's debug window. That proves in minutes whether its UART works,
-which of the four pins is really TX, and at what baud - none of which can be
-determined from the MCU side while both directions are in doubt.
+- **Variables are page-local, not global.** `xPV/xSP/xDuty/xErr` only resolve
+  while the `monitor` page is loaded; `xSPset/xKp/xKi` only while `setup` is.
+  A write from the wrong page returns `1A`. Making them global in the Editor
+  would simplify the firmware considerably.
+- **Apply sends `SP=###,KP=###,KI=###` as text**, which sidesteps page scope
+  entirely and is the right channel for user input. **Start and Stop emit
+  nothing at all** and need `print` statements adding in the Editor before the
+  panel can arm the heater.
 
 ### Measuring things - lessons
 
