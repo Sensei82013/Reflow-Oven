@@ -170,17 +170,28 @@ Confirmed working once moved: the panel answers `sendme` with
 The panel is an **NX8048P070-011C**: 7", 800x480, capacitive, *Intelligent*
 series, default baud 9600, **no USB power**.
 
-See `Software/Display/INTERFACE.md` for the full object map. The two things
-that shape the firmware:
+See `Software/Display/README.txt` for the full object map - that file is the
+contract, and `MODE=nextion` implements it. Four things about it shape the
+firmware:
 
-- **Variables are page-local, not global.** `xPV/xSP/xDuty/xErr` only resolve
-  while the `monitor` page is loaded; `xSPset/xKp/xKi` only while `setup` is.
-  A write from the wrong page returns `1A`. Making them global in the Editor
-  would simplify the firmware considerably.
-- **Apply sends `SP=###,KP=###,KI=###` as text**, which sidesteps page scope
-  entirely and is the right channel for user input. **Start and Stop emit
-  nothing at all** and need `print` statements adding in the Editor before the
-  panel can arm the heater.
+- **Search the HMI for `prints`, not `print`.** An earlier audit of this panel
+  concluded that Start and Stop emitted nothing, because the grep only looked
+  for `print`. They use `prints "p0b20"` / `prints "p0b21"` and always worked.
+  A wrong "the panel sends nothing" sends you looking at wiring for no reason.
+- **Page scope matters, but only for some objects now.** `xPV/xSP/xDuty/xErr`
+  and `xSPset/xKp/xKi` are `vscope=global` and can be written from any page.
+  `tState`, `tLed`, `tMode`, `tAlarm`, `tPI` and the waveform `s0` are still
+  page-local, so writing them while another page is up returns `1A`. The
+  firmware tracks the page from the nav codes `p0b10/11/12` and gates only
+  those. Monitor is page **0** and the boot page - do not assume page 1.
+- **9600 baud is only ~960 byte/s, and that is a real constraint.** Four
+  `x.val=` writes per 250 ms cycle is already a quarter of the link. Send the
+  numbers every cycle and the text and colours only when they change,
+  otherwise the queue backs up and the screen lags behind the plant.
+- **The waveform `add` command takes a single byte.** `add 1,0,<y>` cannot
+  address rows above 255, so with the contract's 2.8 px/°C scale the trace
+  clips at about 91 °C. Enough for bench work; a reflow profile will need
+  either a coarser scale or `addt` bulk transfer.
 
 ### Measuring things - lessons
 
@@ -225,15 +236,11 @@ the far end is a 160 W heater on mains-derived power.
 
 ## Suggested next steps
 
-1. Get the Nextion talking, starting with the USB-TTL test above.
-2. Build the 800x480 HMI. The legacy `Reflow.HMI` targets ~320x240 and cannot
-   run on this panel, but it is a useful specification: objects `t0`
-   (temperature / keypad), `t1`-`t6` (the six profile parameters), `g1`
-   (status), pages 0/2/3, and touch events returned as 5-char codes like
-   `p0b00`.
-3. Point the panel at the existing `g_cmd` / `g_srv` blocks - the PI loop and
-   its safety envelope need no changes to be driven from the display instead
-   of the browser.
-4. Re-characterise the plant once the element position and insulation are
+1. Run `MODE=nextion` on the bench and confirm the arming path end to end:
+   Start turns `tState` green and raises duty, Stop drops it, Apply moves the
+   setpoint. The semihosting log prints every touch code it decodes, so a
+   button that does nothing is easy to tell from a button that was never sent.
+2. Fix the trend waveform's 91 °C ceiling - see the `add` note above.
+3. Re-characterise the plant once the element position and insulation are
    final, then set gains and the duty ceiling from that.
 5. Implement proper reflow profiles on top of the working setpoint loop.

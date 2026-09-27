@@ -108,7 +108,7 @@ The firmware builds in several modes, selected at compile time:
 | `step` | open-loop step at a fixed duty, for plant characterisation |
 | `hold` | park the output at a duty so the driver can be probed |
 | `server` | PI loop steered from the host over SWD - used by the web app |
-| `nextion` | drives the Nextion panel: pushes live temperature, parses Apply, logs touch codes. Does not heat |
+| `nextion` | **PI loop driven from the Nextion panel** - Start/Stop arm it, Apply sets setpoint and gains, telemetry goes back to the screen |
 | `hmi` | Nextion first-contact probe - baud sweep, pin checks, frame dump |
 | `tx` / `rx` | continuous transmit / raw receive capture, for tracing wiring |
 
@@ -120,15 +120,17 @@ The firmware builds in several modes, selected at compile time:
 the MCU, web app with live charts and a dead-man switch, all the safety
 cutoffs.
 
-**Working on the panel:** serial is up. Wire it **straight to PA9 / PA10** -
-not J4, whose level shifters are miswired. The panel answers `sendme` at
-9600, `dim=` visibly changes the backlight, and `MODE=nextion` pushes live
-temperature to the screen and parses the Apply button's
-`SP=###,KP=###,KI=###` string.
+**Working on the panel:** wire it **straight to PA9 / PA10** - not J4, whose
+level shifters are miswired. `MODE=nextion` is a full controller driven from
+the screen: Start and Stop arm and disarm the loop, Apply sets the setpoint
+and gains, and the firmware pushes temperature, setpoint, duty, error, state,
+the status LED, the P/I split and the trend waveform back to the panel. The
+object map is `Software/Display/README.txt`.
 
-**Remaining on the panel:** its Start and Stop buttons emit nothing, so the
-HMI needs `print` statements adding to them before the display can arm the
-heater. See `Software/Display/INTERFACE.md`.
+**Remaining on the panel:** a run on real hardware to confirm the arming path
+end to end. Note the trend waveform's `add` command takes a single byte, so
+the trace clips above about 91 °C - fine for bench work, not for a reflow
+profile.
 
 **Not started:** reflow profiles proper (soak / ramp / peak / cool),
 enclosure, mains-side safety.

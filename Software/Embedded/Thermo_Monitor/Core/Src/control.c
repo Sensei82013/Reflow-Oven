@@ -1357,66 +1357,60 @@ void run_control(void)
 }
 
 
-/* ---- Mode 8: Nextion integration ----------------------------------------
- * Drives Devin's HMI (see Software/Display/INTERFACE.md):
- *
- *   MCU writes   xPV  xSP  xDuty  xErr        (all scaled x10)
- *   MCU reads    xSPset (x10)  xKp  xKi       (both x1000)
- *
- * The panel runs at 9600 with recmod=0, so it only speaks when spoken to -
- * apart from touch events and its power-on banner.
- *
- * This build deliberately does NOT heat. Its job is to bring the screen to
- * life with real temperature and to log every frame the panel sends, so the
- * button codes for Start/Stop/Apply can be read off the wire - they were not
- * recoverable from the compiled .tft. Once those are known the PI loop drops
- * straight in, because g_cmd/g_srv already carry exactly these fields.
- *
- * Frames are assembled properly rather than dumped per read: Nextion binary
- * replies end in FF FF FF, and this HMI's touch codes are five ASCII
- * characters followed by CR LF.
- */
 /* ---- Mode 8: Nextion-driven controller ----------------------------------
- * The panel is the user interface for the PI loop. Wire it straight to
- * PA9/PA10 - J4's level shifters are miswired and have no DC path.
+ * Implements the contract in Software/Display/README.txt.
  *
- *   panel -> MCU   APPLY sends "SP=###,KP=###,KI=###" as text
- *                  START / STOP as "p0b20" / "p0b21" or "CMD=START|STOP"
- *   MCU -> panel   xPV xSP xDuty xErr, all x100, written only while the
- *                  monitor page is loaded (they are page-local, not global)
+ * Wire the panel straight to PA9/PA10 - J4's level shifters are miswired and
+ * have no DC path to the MCU.
  *
- * Both start/stop spellings are accepted so it works whichever way the HMI
- * ends up sending them.
+ * panel -> MCU, ASCII lines ending CR LF:
+ *   p0b20 START      p0b21 STOP
+ *   p0b10/11/12      monitor / setup / trend
+ *   SP=<x10>,KP=<x1000>,KI=<x1000>     from APPLY
  *
- * Safety, same envelope as the web app:
- *   - sensor fault forces duty to 0
- *   - over NX_OVERTEMP the output latches off until reset
- *   - duty is capped by NX_MAX_DUTY, compiled in, which the panel cannot raise
- *   - dead-man: the panel is polled with `sendme`, and if nothing at all
- *     comes back for NX_SILENCE_MS the heater is disarmed. A controller whose
- *     user interface has gone away must not keep heating.
+ * MCU -> panel, ASCII ending FF FF FF:
+ *   xPV xSP xDuty xErr   all x100, vscope global, writable from any page
+ *   tState tLed tMode tPI tAlarm s0   page-local, only while their page is up
+ *
+ * Bandwidth matters here: 9600 baud is ~960 byte/s, so the four numbers go
+ * out every cycle and the decorations only when they change.
+ *
+ * Safety: sensor fault forces duty to 0; over-temperature latches off until
+ * reset; duty is capped by NX_MAX_DUTY, compiled in and not raisable from the
+ * panel; and the heater disarms if the panel goes quiet, because a controller
+ * whose user interface has vanished must not keep heating.
  */
 #elif CONTROL_MODE == 8
 
 #define NX_BAUD          9600u
-#define NX_SILENCE_MS    6000u     /* panel must say something this often */
-#define NX_POLL_MS       1500u     /* how often we prod it with `sendme` */
+#define NX_SILENCE_MS    6000u
+#define NX_POLL_MS       2000u
 
-/* This element is ~160 W into a plant that needs under 1 % duty to hold
- * setpoint, so the ceiling is the real safety device, not the gains. Raise
- * it deliberately: make MODE=nextion NX_MAX_DUTY=5 */
+/* ~160 W into a plant that holds setpoint on under 1 % duty. The ceiling is
+ * the real safety device, not the gains: make MODE=nextion NX_MAX_DUTY=5 */
 #ifndef NX_MAX_DUTY
 #define NX_MAX_DUTY      2.0
 #endif
 
+/* tLed.bco colours, RGB565 decimal, from the HMI contract */
+#define LED_GRAY    33808u
+#define LED_GREEN    2016u
+#define LED_RED     63488u
+#define LED_ORANGE  64800u
+
+/* which page the panel is showing, from the last nav code */
+#define PG_MONITOR  0
+#define PG_SETUP    1
+#define PG_TREND    2
+
 static uint8_t frame[64];
 static uint32_t frame_n;
-static int nx_on_monitor = 1;
+static int nx_page = PG_MONITOR;        /* monitor is the boot page */
 static int nx_enable = 0;
 static uint32_t nx_last_rx;
-static int32_t nx_sp_x10 = 300;        /* 30.0 C */
-static int32_t nx_kp_milli = 200;      /* 0.200 %/C */
-static int32_t nx_ki_milli = 2;        /* 0.002 %/C/s */
+static int32_t nx_sp_x10 = 300;
+static int32_t nx_kp_milli = 200;
+static int32_t nx_ki_milli = 2;
 
 static void nx_tx(const char *cmd)
 {
@@ -1432,11 +1426,17 @@ static void nx_set(const char *obj, int32_t value)
 	nx_tx(buf);
 }
 
+static void nx_txt(const char *obj, const char *value)
+{
+	char buf[80];
+	snprintf(buf, sizeof(buf), "%s.txt=\"%s\"", obj, value);
+	nx_tx(buf);
+}
+
 static void nx_report(const uint8_t *f, uint32_t n)
 {
 	char line[200];
 
-	/* ASCII frames end CR LF: touch codes and the Apply payload. */
 	if (n >= 3u && f[n - 2] == 0x0D && f[n - 1] == 0x0A) {
 		char code[80] = {0};
 		uint32_t c = 0;
@@ -1454,45 +1454,30 @@ static void nx_report(const uint8_t *f, uint32_t n)
 			if (kp) { nx_kp_milli = atoi(kp + 3); }
 			if (ki) { nx_ki_milli = atoi(ki + 3); }
 			snprintf(line, sizeof(line),
-			         "  APPLY: sp %ld.%ld C  Kp %ld.%03ld  Ki %ld.%03ld\r\n",
+			         "  APPLY  sp %ld.%ld C  Kp %ld.%03ld  Ki %ld.%03ld\r\n",
 			         (long)(nx_sp_x10 / 10), (long)(nx_sp_x10 % 10),
 			         (long)(nx_kp_milli / 1000), (long)(nx_kp_milli % 1000),
 			         (long)(nx_ki_milli / 1000), (long)(nx_ki_milli % 1000));
 			emit_dbg(line);
 			return;
 		}
-
-		if (strstr(code, "CMD=START") || !strcmp(code, "p0b20")) {
+		if (!strcmp(code, "p0b20")) {
 			nx_enable = 1;
 			emit_dbg("  START\r\n");
-			return;
-		}
-		if (strstr(code, "CMD=STOP") || !strcmp(code, "p0b21")) {
+		} else if (!strcmp(code, "p0b21")) {
 			nx_enable = 0;
 			emit_dbg("  STOP\r\n");
-			return;
+		} else if (!strcmp(code, "p0b10")) {
+			nx_page = PG_MONITOR;
+		} else if (!strcmp(code, "p0b11")) {
+			nx_page = PG_SETUP;
+		} else if (!strcmp(code, "p0b12")) {
+			nx_page = PG_TREND;
+			nx_tx("cle 1,255");          /* fresh trace on entry */
 		}
-
-		/* nav: p0b10 monitor, p0b11 setup, p0b12 trend */
-		if (!strcmp(code, "p0b10")) {
-			nx_on_monitor = 1;
-		} else if (!strcmp(code, "p0b11") || !strcmp(code, "p0b12")) {
-			nx_on_monitor = 0;
-		}
-		snprintf(line, sizeof(line), "  touch \"%s\"\r\n", code);
-		emit_dbg(line);
-		return;
 	}
-
-	/* Deliberately not inferring the page from `sendme`: the numeric index
-	 * of `monitor` is not known, and guessing it wrongly suppresses all
-	 * telemetry. The nav touch codes are unambiguous, so those are used
-	 * instead and the default is to write. */
-	/* 01 ok, 1A unknown variable, 00 boot - not worth a line each */
 }
 
-/* Pull bytes for `ms`, assembling complete frames. Any byte at all counts as
- * the panel being alive. */
 static void nx_pump(uint32_t ms)
 {
 	uint32_t until = HAL_GetTick() + ms;
@@ -1508,7 +1493,6 @@ static void nx_pump(uint32_t ms)
 		if (frame_n < sizeof(frame)) {
 			frame[frame_n++] = b;
 		}
-
 		int done = 0;
 		if (frame_n >= 3u && frame[frame_n - 1] == 0xFF &&
 		    frame[frame_n - 2] == 0xFF && frame[frame_n - 3] == 0xFF) {
@@ -1544,8 +1528,8 @@ void run_control(void)
 	snprintf(line, sizeof(line),
 	         "\r\n=== Nextion controller ===\r\n"
 	         "  duty ceiling %d.%01d %%, over-temp latch %d C\r\n"
-	         "  START/STOP arm the loop; APPLY sets setpoint and gains\r\n"
-	         "  heater disarms if the panel goes quiet for %lu ms\r\n\r\n",
+	         "  p0b20 START / p0b21 STOP / SP=,KP=,KI= APPLY\r\n"
+	         "  disarms if the panel is silent for %lu ms\r\n\r\n",
 	         (int)duty_max, (int)(duty_max * 10) % 10, (int)OVERTEMP_C,
 	         (unsigned long)NX_SILENCE_MS);
 	emit_dbg(line);
@@ -1553,14 +1537,17 @@ void run_control(void)
 	nx_pump(150);
 	nx_tx("bkcmd=1");
 	nx_pump(150);
-	nx_tx("page monitor");
-	nx_pump(300);
+	nx_txt("tMode", "CONSTANT");
+	nx_pump(100);
 
 	const float dt = (float)CTRL_PERIOD_MS / 1000.0f;
 	float integ_err = 0.0f;
 	uint32_t next = HAL_GetTick();
-	uint32_t last_poll = 0;
+	uint32_t last_poll = 0, last_pi = 0;
 	uint32_t iter = 0;
+	const char *shown_state = "";
+	uint32_t shown_led = 0;
+	int shown_alarm = -1;
 	nx_last_rx = HAL_GetTick();
 
 	for (;;) {
@@ -1580,70 +1567,115 @@ void run_control(void)
 		float kp = (float)nx_kp_milli / 1000.0f;
 		float ki = (float)nx_ki_milli / 1000.0f;
 		float sp = (float)nx_sp_x10 / 10.0f;
-		float duty = 0.0f;
+		float duty = 0.0f, p_term = 0.0f, i_term = 0.0f;
 		const char *state;
+		uint32_t led;
 
 		if (latched_off) {
-			state = "OVERTEMP";
+			state = "OVER TEMP";  led = LED_RED;
 		} else if (!ok) {
-			state = "SENSOR FAULT";
+			state = "TC FAULT";   led = LED_RED;
 			integ_err = 0.0f;
 		} else if (!alive) {
-			state = "PANEL LOST";
+			state = "WARNING";    led = LED_ORANGE;
 			nx_enable = 0;
 			integ_err = 0.0f;
 		} else if (!nx_enable) {
-			state = "IDLE";
+			state = "IDLE";       led = LED_GRAY;
 			integ_err = 0.0f;
 		} else {
 			float err = sp - t;
 			if (ki > 0.0f) {
 				float cand = integ_err + err * dt;
-				if ((kp * err + ki * cand) > 0.0f &&
-				    (kp * err + ki * cand) < duty_max) {
+				float u = kp * err + ki * cand;
+				if (u > 0.0f && u < duty_max) {
 					integ_err = cand;
 				}
 			} else {
 				integ_err = 0.0f;
 			}
-			duty = kp * err + ki * integ_err;
+			p_term = kp * err;
+			i_term = ki * integ_err;
+			duty = p_term + i_term;
 			if (duty < 0.0f) {
 				duty = 0.0f;
 			}
 			if (duty > duty_max) {
 				duty = duty_max;
 			}
-			state = "RUNNING";
+			state = "HEATING";    led = LED_GREEN;
 		}
 		heater_set(duty);
 
-		/* Telemetry, x100, only while the monitor page is loaded. */
-		if (nx_on_monitor) {
-			int32_t pv_x100 = ok ? (max6675_milli_c(raw) / 10) : 0;
-			int32_t sp_x100 = nx_sp_x10 * 10;
-			nx_set("xPV", pv_x100);
-			nx_set("xSP", sp_x100);
-			nx_set("xDuty", (int32_t)(duty * 100.0f));
-			nx_set("xErr", sp_x100 - pv_x100);
+		/* --- global values: safe to write from any page ------------- */
+		int32_t pv_x100 = ok ? (max6675_milli_c(raw) / 10) : 0;
+		int32_t sp_x100 = nx_sp_x10 * 10;
+		nx_set("xPV", pv_x100);
+		nx_set("xSP", sp_x100);
+		nx_set("xDuty", (int32_t)(duty * 100.0f));
+		nx_set("xErr", sp_x100 - pv_x100);
+
+		/* --- decorations: only on change, and only where they live --- */
+		if (state != shown_state) {
+			shown_state = state;
+			if (nx_page == PG_MONITOR) {
+				nx_txt("tState", state);
+			}
+		}
+		if (led != shown_led) {
+			shown_led = led;
+			if (nx_page == PG_MONITOR) {
+				nx_set("tLed.bco", (int32_t)led);
+			}
+		}
+		int alarm = latched_off ? 1 : 0;
+		if (alarm != shown_alarm && nx_page == PG_MONITOR) {
+			shown_alarm = alarm;
+			if (alarm) {
+				nx_txt("tAlarm", "OVER-TEMPERATURE - OUTPUT LATCHED OFF");
+			}
+			nx_tx(alarm ? "vis tAlarm,1" : "vis tAlarm,0");
+		}
+		if (nx_page == PG_MONITOR && (now - last_pi) >= 1000u) {
+			last_pi = now;
+			char pi[40];
+			snprintf(pi, sizeof(pi), "%ld.%01ld / %ld.%01ld %%",
+			         (long)p_term, (long)((int32_t)(p_term * 10.0f) % 10),
+			         (long)i_term, (long)((int32_t)(i_term * 10.0f) % 10));
+			nx_txt("tPI", pi);
+		}
+
+		/* --- trend: one sample pair while that page is up ------------
+		 * `add` takes a single byte, so rows above 255 are unreachable;
+		 * the contract places the 100 C label at row 255 accordingly. */
+		if (nx_page == PG_TREND) {
+			int32_t y = (int32_t)(t * 2.8f + 0.5f);
+			if (y < 0)   { y = 0; }
+			if (y > 255) { y = 255; }
+			snprintf(line, sizeof(line), "add 1,0,%ld", (long)y);
+			nx_tx(line);
+			int32_t ys = (int32_t)(sp * 2.8f + 0.5f);
+			if (ys < 0)   { ys = 0; }
+			if (ys > 255) { ys = 255; }
+			snprintf(line, sizeof(line), "add 1,1,%ld", (long)ys);
+			nx_tx(line);
 		}
 
 		if ((now - last_poll) >= NX_POLL_MS) {
 			last_poll = now;
-			nx_tx("sendme");            /* also our liveness probe */
+			nx_tx("sendme");             /* doubles as the liveness probe */
 		}
 
 		if ((iter % 8u) == 0u) {
 			snprintf(line, sizeof(line),
-			         "  %-12s PV %ld.%02ld  SP %ld.%ld  duty %ld.%02ld %%%s\r\n",
+			         "  %-10s PV %ld.%02ld  SP %ld.%ld  duty %ld.%02ld %%  page %d\r\n",
 			         state,
 			         (long)t, (long)((int32_t)(t * 100.0f) % 100),
 			         (long)(nx_sp_x10 / 10), (long)(nx_sp_x10 % 10),
-			         (long)duty, (long)((int32_t)(duty * 100.0f) % 100),
-			         nx_on_monitor ? "" : "  (panel on another page)");
+			         (long)duty, (long)((int32_t)(duty * 100.0f) % 100), nx_page);
 			emit_dbg(line);
 		}
 
-		nx_pump(60);
 		iter++;
 		next += CTRL_PERIOD_MS;
 		while ((int32_t)(HAL_GetTick() - next) < 0) {
