@@ -1407,7 +1407,7 @@ static uint8_t frame[64];
 static uint32_t frame_n;
 static int nx_page = PG_MONITOR;        /* monitor is the boot page */
 static int nx_enable = 0;
-static uint32_t nx_last_rx;
+static volatile uint32_t nx_last_rx;
 static int32_t nx_sp_x10 = 300;
 static int32_t nx_kp_milli = 200;
 static int32_t nx_ki_milli = 2;
@@ -1478,18 +1478,41 @@ static void nx_report(const uint8_t *f, uint32_t n)
 	}
 }
 
+/* RX runs on an interrupt, not on polling. The control cycle cannot be relied
+ * on to visit the UART often enough: the MAX6675 conversion alone is 220 ms of
+ * a 250 ms period, and the telemetry writes are blocking on top of that, so a
+ * polled receive loses bytes and the dead-man trips at random. The USART1 NVIC
+ * line is unused by this project's MSP, so claim it here. */
+static volatile uint8_t nx_ring[256];
+static volatile uint8_t nx_head, nx_tail;
+
+void USART1_IRQHandler(void)
+{
+	if (USART1->SR & (USART_SR_RXNE | USART_SR_ORE)) {
+		uint8_t b = (uint8_t)(USART1->DR & 0xFF);   /* the read clears ORE */
+		uint8_t h = (uint8_t)(nx_head + 1u);
+		if (h != nx_tail) {                        /* drop, never overwrite */
+			nx_ring[nx_head] = b;
+			nx_head = h;
+		}
+		nx_last_rx = HAL_GetTick();
+	}
+}
+
+/* Drain the ring for up to `ms`, assembling frames. ms = 0 takes whatever is
+ * already there and returns. Any byte at all counts as the panel being alive. */
 static void nx_pump(uint32_t ms)
 {
 	uint32_t until = HAL_GetTick() + ms;
-	while ((int32_t)(HAL_GetTick() - until) < 0) {
-		if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_ORE)) {
-			__HAL_UART_CLEAR_OREFLAG(&huart1);
-		}
-		if (!__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE)) {
+	for (;;) {
+		if (nx_tail == nx_head) {
+			if ((int32_t)(HAL_GetTick() - until) >= 0) {
+				return;
+			}
 			continue;
 		}
-		uint8_t b = (uint8_t)(huart1.Instance->DR & 0xFF);
-		nx_last_rx = HAL_GetTick();
+		uint8_t b = nx_ring[nx_tail];
+		nx_tail = (uint8_t)(nx_tail + 1u);
 		if (frame_n < sizeof(frame)) {
 			frame[frame_n++] = b;
 		}
@@ -1533,6 +1556,11 @@ void run_control(void)
 	         (int)duty_max, (int)(duty_max * 10) % 10, (int)OVERTEMP_C,
 	         (unsigned long)NX_SILENCE_MS);
 	emit_dbg(line);
+
+	nx_head = nx_tail = 0;
+	USART1->CR1 |= USART_CR1_RXNEIE;
+	HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+	HAL_NVIC_EnableIRQ(USART1_IRQn);
 
 	nx_pump(150);
 	nx_tx("bkcmd=1");
@@ -1678,6 +1706,10 @@ void run_control(void)
 
 		iter++;
 		next += CTRL_PERIOD_MS;
+		if ((int32_t)(HAL_GetTick() - next) > (int32_t)CTRL_PERIOD_MS) {
+			next = HAL_GetTick();      /* overran: resync, do not chase */
+		}
+		nx_pump(0);                    /* always drain, even with no slack */
 		while ((int32_t)(HAL_GetTick() - next) < 0) {
 			nx_pump(5);
 		}

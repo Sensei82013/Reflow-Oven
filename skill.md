@@ -188,6 +188,13 @@ firmware:
   `x.val=` writes per 250 ms cycle is already a quarter of the link. Send the
   numbers every cycle and the text and colours only when they change,
   otherwise the queue backs up and the screen lags behind the plant.
+- **Do not poll the UART from the control loop.** The MAX6675 conversion is
+  220 ms of a 250 ms cycle and the telemetry writes are blocking on top of it,
+  so a polled receive gets almost no time, drops bytes, and the dead-man trips
+  at random - it looks exactly like a flaky panel or a bad wire. `MODE=nextion`
+  claims `USART1_IRQn` (unused by this project's MSP) and receives into a ring
+  buffer instead. A cycle that overruns also resyncs its deadline rather than
+  chasing it, so it never spirals.
 - **The waveform `add` command takes a single byte.** `add 1,0,<y>` cannot
   address rows above 255, so with the contract's 2.8 px/°C scale the trace
   clips at about 91 °C. Enough for bench work; a reflow profile will need
