@@ -63,6 +63,11 @@ endif
 ifeq ($(MODE),nextion)
 DEFS += -DCONTROL_MODE=8
 endif
+# Duty ceiling for the panel-driven controller; it cannot be raised from
+# the display. Default 2 %, which suits this oversized element.
+ifdef NX_MAX_DUTY
+DEFS += -DNX_MAX_DUTY=$(NX_MAX_DUTY)
+endif
 # Retune without touching the source:  make MODE=pi KP=8.0 KI=0.4
 ifdef KP
 DEFS += -DKP_RAW=$(KP)
