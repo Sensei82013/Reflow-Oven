@@ -1688,8 +1688,26 @@ void run_control(void)
 			if (ki > 0.0f) {
 				float cand = integ_err + err * dt;
 				float u = kp * err + ki * cand;
-				if (u > 0.0f && u < duty_max) {
+				/* Conditional integration, blocked only in the direction that
+				 * would push further into a rail. The previous test blocked
+				 * BOTH directions while saturated, which let the integral
+				 * freeze at a value whose I term alone met the ceiling - after
+				 * which duty sat at the cap permanently and no setpoint or gain
+				 * change could retrieve it. Integration that relieves the rail
+				 * must always be allowed. */
+				int relieving = (err < 0.0f && u >= duty_max) ||
+				                (err > 0.0f && u <= 0.0f);
+				if ((u > 0.0f && u < duty_max) || relieving) {
 					integ_err = cand;
+				}
+				/* The element only heats, so a negative integral is just lag,
+				 * and I alone must never be able to exceed the ceiling or P
+				 * loses all authority over the output. */
+				if (integ_err < 0.0f) {
+					integ_err = 0.0f;
+				}
+				if (integ_err > duty_max / ki) {
+					integ_err = duty_max / ki;
 				}
 			} else {
 				integ_err = 0.0f;
@@ -1767,11 +1785,19 @@ void run_control(void)
 		}
 
 		if ((iter % 8u) == 0u) {
+			/* P and I are reported separately on purpose. A duty sitting on the
+			 * ceiling says nothing about why: an over-large Kp and a wound-up
+			 * integral look identical in the total. Milli-units so the printing
+			 * stays integer and signs survive. */
 			snprintf(line, sizeof(line),
-			         "  %-10s PV %ld.%02ld  SP %ld.%ld  duty %ld.%02ld %%  page %d\r\n",
+			         "  %-10s PV %ld.%02ld  SP %ld.%ld  Kp %ld.%03ld Ki %ld.%03ld"
+			         "  P %ld I %ld milli  duty %ld.%02ld %%  page %d\r\n",
 			         state,
 			         (long)t, (long)((int32_t)(t * 100.0f) % 100),
 			         (long)(nx_sp_x10 / 10), (long)(nx_sp_x10 % 10),
+			         (long)(nx_kp_milli / 1000), (long)(nx_kp_milli % 1000),
+			         (long)(nx_ki_milli / 1000), (long)(nx_ki_milli % 1000),
+			         (long)(p_term * 1000.0f), (long)(i_term * 1000.0f),
 			         (long)duty, (long)((int32_t)(duty * 100.0f) % 100), nx_page);
 			emit_dbg(line);
 		}
