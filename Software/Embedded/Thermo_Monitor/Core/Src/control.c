@@ -1513,6 +1513,7 @@ volatile struct {
 	uint16_t duty_x100[TRACE_N];
 } g_trace;
 static int nx_page = PG_MONITOR;        /* monitor is the boot page */
+static int nx_resync = 1;               /* re-send every page-local object */
 static int nx_enable = 0;
 static volatile uint32_t nx_last_rx;
 /* Power-on defaults, overridable at build time so a bench run needs only a
@@ -1597,6 +1598,7 @@ static void nx_report(const uint8_t *f, uint32_t n)
 			emit_dbg("  STOP\r\n");
 		} else if (strstr(code, "p0b10")) {
 			nx_page = PG_MONITOR;
+			nx_resync = 1;
 		} else if (strstr(code, "p0b11")) {
 			nx_page = PG_SETUP;
 		} else if (strstr(code, "p0b12")) {
@@ -1615,7 +1617,11 @@ static void nx_report(const uint8_t *f, uint32_t n)
 	/* 66 <page> FF FF FF, the reply to `sendme`. Trust it over the nav codes:
 	 * it also reports the keyboard page, which no nav button announces. */
 	if (n >= 2u && f[0] == 0x66) {
-		nx_page = (int)f[1];
+		int page = (int)f[1];
+		if (page != nx_page) {
+			nx_resync = 1;   /* a page load resets its objects to design values */
+		}
+		nx_page = page;
 	}
 }
 
@@ -1860,26 +1866,37 @@ void run_control(void)
 		nx_set("xDuty", (int32_t)(duty * 100.0f));
 		nx_set("xErr", sp_x100 - pv_x100);
 
-		/* --- decorations: only on change, and only where they live --- */
-		if (state != shown_state) {
-			shown_state = state;
-			if (nx_page == PG_MONITOR) {
+		/* --- decorations: page-local, so they need care -----------------
+		 * Only mark something as shown once it has actually been sent. The
+		 * earlier version assigned shown_* even when the write was skipped
+		 * for being on the wrong page, so a state change that happened off
+		 * the monitor page was recorded as displayed and never sent - the
+		 * panel then sat on stale text indefinitely.
+		 *
+		 * A page load also resets page-local objects to their design values,
+		 * so returning to the monitor page must re-send everything even
+		 * though nothing changed. resync forces that. */
+		if (nx_page == PG_MONITOR) {
+			if (nx_resync || state != shown_state) {
+				shown_state = state;
 				nx_txt("tState", state);
 			}
-		}
-		if (led != shown_led) {
-			shown_led = led;
-			if (nx_page == PG_MONITOR) {
+			if (nx_resync || led != shown_led) {
+				shown_led = led;
 				nx_set("tLed.bco", (int32_t)led);
 			}
-		}
-		int alarm = latched_off ? 1 : 0;
-		if (alarm != shown_alarm && nx_page == PG_MONITOR) {
-			shown_alarm = alarm;
-			if (alarm) {
-				nx_txt("tAlarm", "OVER-TEMPERATURE - OUTPUT LATCHED OFF");
+			int alarm = latched_off ? 1 : 0;
+			if (nx_resync || alarm != shown_alarm) {
+				shown_alarm = alarm;
+				if (alarm) {
+					nx_txt("tAlarm", "OVER-TEMPERATURE - OUTPUT LATCHED OFF");
+				}
+				nx_tx(alarm ? "vis tAlarm,1" : "vis tAlarm,0");
 			}
-			nx_tx(alarm ? "vis tAlarm,1" : "vis tAlarm,0");
+			if (nx_resync) {
+				nx_txt("tMode", "CONSTANT");
+			}
+			nx_resync = 0;
 		}
 		if (nx_page == PG_MONITOR && (now - last_pi) >= 1000u) {
 			last_pi = now;
