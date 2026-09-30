@@ -63,10 +63,32 @@ endif
 ifeq ($(MODE),nextion)
 DEFS += -DCONTROL_MODE=8
 endif
-# Duty ceiling for the panel-driven controller; it cannot be raised from
-# the display. Default 2 %, which suits this oversized element.
+# Duty ceiling for the panel-driven controller; it cannot be raised from the
+# display. A backstop against a bad gain, not a working limit - default 30 %.
 ifdef NX_MAX_DUTY
 DEFS += -DNX_MAX_DUTY=$(NX_MAX_DUTY)
+endif
+# Setpoint ramp, C/s. 0 restores the old step behaviour.
+ifdef NX_RAMP
+DEFS += -DNX_RAMP=$(NX_RAMP)
+endif
+# Power-on setpoint and gains for the panel controller, in the panel's own
+# units: NX_SP is x10 C, NX_KP and NX_KI are x1000. Lets a bench run be set
+# up at build time instead of through the panel's 0.01-per-press steppers.
+#   make MODE=nextion NX_SP=900 NX_KP=1000 NX_KI=10
+ifdef NX_SP
+DEFS += -DNX_SP=$(NX_SP)
+endif
+ifdef NX_KP
+DEFS += -DNX_KP=$(NX_KP)
+endif
+ifdef NX_KI
+DEFS += -DNX_KI=$(NX_KI)
+endif
+# Silence the semihosting log so a debugger can attach mid-run without the
+# next bkpt halting the core. Required for unattended runs read via g_trace.
+ifdef NX_QUIET
+DEFS += -DNX_QUIET=1
 endif
 # Retune without touching the source:  make MODE=pi KP=8.0 KI=0.4
 ifdef KP

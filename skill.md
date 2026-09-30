@@ -113,6 +113,12 @@ never be acted on.
   IRF520N and, left in place, is a silent no-op. At 200 Hz a 1 % duty is a
   48 us pulse, about twenty times shorter than the relay can respond to, so
   the loop reports a sensible duty and the element gets nothing at all.
+- **Halting the core does NOT stop the heater** - TIM1 is hardware and keeps
+  driving PA8. A capture that ended early once left the element at 3.25 % duty
+  indefinitely with no control loop behind it, because the host script's park
+  step never got to run. `heater_init()` now sets `__HAL_DBGMCU_FREEZE_TIM1()`,
+  so any debugger halt stops the timer too. Treat "the debugger stopped" as a
+  state that must be safe by construction, not one the tooling cleans up.
 - **`heater_off()` is destructive, so arming again must be explicit.** It stops
   the timer and reconfigures PA8 as a plain GPIO output low, deliberately, so
   the pin is held down by the GPIO block even if the timer misbehaves. But
@@ -226,6 +232,31 @@ firmware:
   clips at about 91 °C. Enough for bench work; a reflow profile will need
   either a coarser scale or `addt` bulk transfer.
 
+### Long unattended runs
+
+A 30-minute hold test cannot have a debugger attached for its duration, and
+getting that right took several attempts:
+
+- **Semihosting output is the hazard.** Any attach sets `C_DEBUGEN`; a
+  `bkpt #0xAB` reached while no servicer is listening halts the core *for
+  good*. So merely peeking at a run kills it - a read-only check stopped a
+  hold test dead. Build long runs with **`NX_QUIET=1`**, which makes the mode 8
+  loop silent, and the board can then be attached to and read at will. Note
+  `main()`'s own banner is still noisy, so the arming session must enable
+  semihosting even for a quiet build.
+- **Read the trace, not the log.** `g_trace` is a RAM ring - 512 samples of
+  temperature and duty at 5 s, i.e. 42 minutes - read over SWD afterwards.
+  `g_nx` carries the panel counters the same way.
+- **Detach by clearing `C_DEBUGEN`**: `mww 0xE000EDF0 0xA05F0000` as the last
+  command. OpenOCD's `shutdown` leaves it set, so the firmware would otherwise
+  halt at its next bkpt.
+- **Read memory without halting.** `mdw` works on a running target. Issuing
+  `resume` to an already-running core errors with `not halted` and **aborts
+  the rest of the OpenOCD command sequence**, which is how one peek skipped
+  its own `C_DEBUGEN` cleanup and killed the run.
+- **Background tasks get truncated** somewhere around 5 minutes, and a
+  truncated capture is exactly the case that used to leave the heater on.
+
 ### Measuring things - lessons
 
 Two of our own instruments gave confidently wrong answers:
@@ -247,9 +278,14 @@ Present in firmware and worth preserving:
 
 - Any sensor fault forces duty to 0. A controller that cannot see temperature
   must not drive a heater.
-- Above `OVERTEMP` (default 120 °C) the output **latches off** until reset.
-  Temperature keeps being published while latched - that is exactly when you
-  want to see it.
+- Above `OVERTEMP` (default 120 °C) the output **latches off**. Temperature
+  keeps being published while latched - that is exactly when you want to see
+  it. In `MODE=nextion`, **STOP clears the latch** once the oven has cooled
+  below `OVERTEMP_REARM_C` (15 °C of hysteresis). Until that was added the
+  latch was cleared nowhere in the firmware at all, so one trip meant
+  power-cycling the board before it would heat again - which presents as "the
+  controller is stuck". Requiring a real cool-down keeps STOP a reset button
+  rather than a bypass.
 - Every profile stage times out rather than sitting at full power forever.
 - **Dead-man switch:** the firmware only heats while it receives a heartbeat,
   and the bridge only relays that heartbeat while a client has called the API

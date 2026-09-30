@@ -167,6 +167,14 @@ static void heater_init(void)
 	__HAL_RCC_TIM1_CLK_ENABLE();
 	__HAL_RCC_GPIOA_CLK_ENABLE();
 
+	/* Stop TIM1 whenever the debugger halts the core. Without this the timer
+	 * is hardware and keeps driving the element after a halt, so a debug
+	 * session that ends unexpectedly - a truncated capture, a breakpoint, a
+	 * crashed host - leaves the heater running with no control loop behind it.
+	 * Observed: a capture cut short left PA8 at 3.25 % duty indefinitely.
+	 * The host scripts also park PA8, but that only helps if they get to run. */
+	__HAL_DBGMCU_FREEZE_TIM1();
+
 	htim1.Instance = TIM1;
 	uint32_t tick_hz = (uint32_t)PWM_HZ * PWM_PERIOD;
 	uint32_t presc = (HAL_RCC_GetPCLK2Freq() + tick_hz / 2u) / tick_hz;
@@ -1408,10 +1416,53 @@ void run_control(void)
 #define NX_SILENCE_MS    6000u
 #define NX_POLL_MS       2000u
 
-/* ~160 W into a plant that holds setpoint on under 1 % duty. The ceiling is
- * the real safety device, not the gains: make MODE=nextion NX_MAX_DUTY=5 */
+/* A true backstop, not a working limit. Kp and Ki do the controlling; this only
+ * catches a gain that arrives wrong - the panel's Kp field ranges to 200, so a
+ * mis-entered 250 instead of 2.50 commands full power into a 160 W element, and
+ * a compiled ceiling is the only guard that survives a bad value on the wire.
+ * Set it well above normal operation so it never shapes the response.
+ *
+ * It was 2.0, which was a working limit masquerading as a safety limit: the
+ * loop spent its whole time clamped, duty read a constant 2.00 %, and no gain
+ * or setpoint change had any visible effect.
+ *
+ *   make MODE=nextion NX_MAX_DUTY=8     tighter, for a known low setpoint
+ *   make MODE=nextion NX_MAX_DUTY=100   no ceiling at all
+ */
 #ifndef NX_MAX_DUTY
-#define NX_MAX_DUTY      2.0
+#define NX_MAX_DUTY      30.0
+#endif
+
+/* Setpoint ramp, degrees C per second. This plant has roughly 27 s of thermal
+ * coast, so a step setpoint guarantees overshoot however the gains are set:
+ * the loop commands heavily on a huge error and the energy already in flight
+ * arrives long after the probe has caught up. Ramping keeps the error small
+ * for the whole climb, which is what lets Kp be large enough to be useful
+ * near setpoint without being dangerous far from it. A reflow profile is the
+ * same idea with more segments.
+ *
+ * 0.2 C/s climbs 23 -> 90 C in about six minutes and holds the lag near 5 C.
+ *   make MODE=nextion NX_RAMP=0    to disable and step as before
+ */
+#ifndef NX_RAMP
+#define NX_RAMP          0.2
+#endif
+
+/* The over-temperature latch is deliberately sticky, but it used to need a
+ * power cycle because nothing ever cleared it. STOP now clears it once the
+ * oven has come back below this, which is a real cool-down, not a bypass. */
+#define OVERTEMP_REARM_C  ((float)(OVERTEMP_C) - 15.0f)
+
+/* A long unattended run records into g_trace and must never execute a
+ * semihosting bkpt. Any debugger attach sets C_DEBUGEN, and a bkpt reached
+ * while no servicer is listening halts the core permanently - so merely
+ * peeking at the trace kills the run it was meant to observe. Learned the
+ * hard way: a read-only peek stopped a hold test dead.
+ *   make MODE=nextion NX_QUIET=1
+ */
+#ifdef NX_QUIET
+#undef emit_dbg
+#define emit_dbg(s) ((void)(s))
 #endif
 
 /* tLed.bco colours, RGB565 decimal, from the HMI contract */
@@ -1428,6 +1479,7 @@ void run_control(void)
 static uint8_t frame[64];
 static uint32_t frame_n;
 static uint32_t nx_last_byte;
+static int nx_clear_req = 0;     /* STOP asks the loop to clear the latch */
 
 /* Panel diagnostics. Deliberately non-static so `nm` can find the symbol:
  * OpenOCD reads this through the DAP while the core keeps running, which means
@@ -1444,12 +1496,42 @@ volatile struct {
 	uint32_t overflows;  /* frame buffer reset because it filled */
 	char     last[32];   /* most recent decoded code */
 } g_nx;
+
+/* A run history in RAM, so a long test does not need a debugger attached for
+ * its whole duration. That matters for safety as much as convenience: an
+ * attached session that ends early halts the core, and before the DBGMCU
+ * freeze above that left TIM1 driving the element unattended. With the trace
+ * the board runs standalone and the whole run is read back afterwards.
+ *
+ * 512 samples at 5 s is 42 minutes. index = count % TRACE_N, and count says
+ * how many were written, so a wrapped buffer is still unambiguous. */
+#define TRACE_N 512
+volatile struct {
+	uint32_t count;
+	uint32_t period_s;
+	int16_t  temp_x10[TRACE_N];
+	uint16_t duty_x100[TRACE_N];
+} g_trace;
 static int nx_page = PG_MONITOR;        /* monitor is the boot page */
 static int nx_enable = 0;
 static volatile uint32_t nx_last_rx;
-static int32_t nx_sp_x10 = 300;
-static int32_t nx_kp_milli = 200;
-static int32_t nx_ki_milli = 2;
+/* Power-on defaults, overridable at build time so a bench run needs only a
+ * START press - the panel's +/- steppers move Kp by 0.01 and Ki by 0.001,
+ * which makes dialling in a gain from the screen impractical.
+ *   make MODE=nextion NX_SP=900 NX_KP=1000 NX_KI=10    90.0 C, Kp 1.0, Ki 0.01
+ */
+#ifndef NX_SP
+#define NX_SP  300
+#endif
+#ifndef NX_KP
+#define NX_KP  200
+#endif
+#ifndef NX_KI
+#define NX_KI  2
+#endif
+static int32_t nx_sp_x10 = NX_SP;
+static int32_t nx_kp_milli = NX_KP;
+static int32_t nx_ki_milli = NX_KI;
 
 static void nx_tx(const char *cmd)
 {
@@ -1510,6 +1592,7 @@ static void nx_report(const uint8_t *f, uint32_t n)
 			emit_dbg("  START\r\n");
 		} else if (strstr(code, "p0b21")) {
 			nx_enable = 0;
+			nx_clear_req = 1;    /* the loop has the temperature, not us */
 			g_nx.stops++;
 			emit_dbg("  STOP\r\n");
 		} else if (strstr(code, "p0b10")) {
@@ -1648,6 +1731,12 @@ void run_control(void)
 	const char *shown_state = "";
 	uint32_t shown_led = 0;
 	int shown_alarm = -1;
+	int armed = 0;                 /* the loop was heating on the last pass */
+	float sp_ramp = 0.0f;          /* the setpoint the PI loop actually chases */
+	const float ramp_rate = (float)(NX_RAMP);
+	uint32_t last_trace = 0;
+	g_trace.count = 0;
+	g_trace.period_s = 5u;
 	nx_last_rx = HAL_GetTick();
 
 	for (;;) {
@@ -1663,27 +1752,65 @@ void run_control(void)
 			emit_dbg("  SAFETY: over temperature, latched off\r\n");
 		}
 
+		/* STOP asks to clear the latch. Honour it only once the oven has
+		 * genuinely cooled - that makes STOP a reset button instead of a
+		 * bypass, and removes the power cycle that used to be the only way
+		 * out of a trip. */
+		if (nx_clear_req) {
+			nx_clear_req = 0;
+			if (latched_off && ok && t < OVERTEMP_REARM_C) {
+				latched_off = 0;
+				integ_err = 0.0f;
+				emit_dbg("  latch cleared\r\n");
+			} else if (latched_off) {
+				emit_dbg("  latch held: still too hot to re-arm\r\n");
+			}
+		}
+
 		int alive = (now - nx_last_rx) < NX_SILENCE_MS;
 		float kp = (float)nx_kp_milli / 1000.0f;
 		float ki = (float)nx_ki_milli / 1000.0f;
-		float sp = (float)nx_sp_x10 / 10.0f;
+		float sp_target = (float)nx_sp_x10 / 10.0f;
 		float duty = 0.0f, p_term = 0.0f, i_term = 0.0f;
 		const char *state;
 		uint32_t led;
 
 		if (latched_off) {
 			state = "OVER TEMP";  led = LED_RED;
+			armed = 0;
 		} else if (!ok) {
 			state = "TC FAULT";   led = LED_RED;
 			integ_err = 0.0f;
+			armed = 0;
 		} else if (!alive) {
 			state = "WARNING";    led = LED_ORANGE;
 			nx_enable = 0;
 			integ_err = 0.0f;
+			armed = 0;
 		} else if (!nx_enable) {
 			state = "IDLE";       led = LED_GRAY;
 			integ_err = 0.0f;
+			armed = 0;
 		} else {
+			/* Start the ramp from wherever the oven actually is, so arming
+			 * never presents the loop with a step it has to chase. */
+			if (!armed) {
+				armed = 1;
+				sp_ramp = t;
+			}
+			if (ramp_rate > 0.0f) {
+				float step = ramp_rate * dt;
+				if (sp_ramp < sp_target) {
+					sp_ramp += step;
+					if (sp_ramp > sp_target) { sp_ramp = sp_target; }
+				} else if (sp_ramp > sp_target) {
+					sp_ramp -= step;
+					if (sp_ramp < sp_target) { sp_ramp = sp_target; }
+				}
+			} else {
+				sp_ramp = sp_target;
+			}
+			float sp = sp_ramp;
 			float err = sp - t;
 			if (ki > 0.0f) {
 				float cand = integ_err + err * dt;
@@ -1772,7 +1899,7 @@ void run_control(void)
 			if (y > 255) { y = 255; }
 			snprintf(line, sizeof(line), "add 1,0,%ld", (long)y);
 			nx_tx(line);
-			int32_t ys = (int32_t)(sp * 2.8f + 0.5f);
+			int32_t ys = (int32_t)(sp_ramp * 2.8f + 0.5f);
 			if (ys < 0)   { ys = 0; }
 			if (ys > 255) { ys = 255; }
 			snprintf(line, sizeof(line), "add 1,1,%ld", (long)ys);
@@ -1784,17 +1911,26 @@ void run_control(void)
 			nx_tx("sendme");             /* doubles as the liveness probe */
 		}
 
+		if ((now - last_trace) >= (g_trace.period_s * 1000u)) {
+			last_trace = now;
+			uint32_t i = g_trace.count % TRACE_N;
+			g_trace.temp_x10[i] = (int16_t)(ok ? (max6675_milli_c(raw) / 100) : -1);
+			g_trace.duty_x100[i] = (uint16_t)(duty * 100.0f);
+			g_trace.count++;
+		}
+
 		if ((iter % 8u) == 0u) {
 			/* P and I are reported separately on purpose. A duty sitting on the
 			 * ceiling says nothing about why: an over-large Kp and a wound-up
 			 * integral look identical in the total. Milli-units so the printing
 			 * stays integer and signs survive. */
 			snprintf(line, sizeof(line),
-			         "  %-10s PV %ld.%02ld  SP %ld.%ld  Kp %ld.%03ld Ki %ld.%03ld"
+			         "  %-10s PV %ld.%02ld  SP %ld.%ld ramp %ld.%ld  Kp %ld.%03ld Ki %ld.%03ld"
 			         "  P %ld I %ld milli  duty %ld.%02ld %%  page %d\r\n",
 			         state,
 			         (long)t, (long)((int32_t)(t * 100.0f) % 100),
 			         (long)(nx_sp_x10 / 10), (long)(nx_sp_x10 % 10),
+			         (long)sp_ramp, (long)((int32_t)(sp_ramp * 10.0f) % 10),
 			         (long)(nx_kp_milli / 1000), (long)(nx_kp_milli % 1000),
 			         (long)(nx_ki_milli / 1000), (long)(nx_ki_milli % 1000),
 			         (long)(p_term * 1000.0f), (long)(i_term * 1000.0f),
